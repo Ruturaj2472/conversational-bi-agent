@@ -29,9 +29,7 @@ State:
     chart_config  - LLM-decided chart config dict, or None
 """
 
-import json
 import logging
-import re
 from typing import Annotated, Any, Literal, Optional
 
 from langchain.chat_models import init_chat_model
@@ -289,11 +287,10 @@ CHART MODE — the user wants a visualisation:
     # NODE 4 — chart_config
     #
     # Receives actual sql_rows + sql_columns from state.
-    # Asks gpt-4.1-mini to decide the best chart type and column mapping.
-    # Always produces a chart config — NEVER returns "none" here because
-    # wants_chart=True is the only reason this node runs.
-    # If data is truly unplottable, it will fabricate the best possible config
-    # (e.g. a single-value bar chart is still valid).
+    # Asks the fast model (structured output) for the best chart type and columns.
+    # Skips the LLM call when the query returned no rows. Otherwise always
+    # produces a chart config — wants_chart=True is the only reason this node
+    # runs, and even a single-value bar chart is valid.
     # ══════════════════════════════════════════════════════════════════════════
     CHART_CONFIG_SYSTEM = """You are a data visualisation expert for a BI system.
 
@@ -315,22 +312,26 @@ Special case — single row / scalar result:
 - Never refuse to produce a chart config.
 
 x_col and y_col MUST be exact column names from the provided columns list.
-
-Return ONLY valid JSON, no markdown fences, no explanation:
-{
-  "chart_type": "<bar|line|pie|scatter|histogram>",
-  "x_col":      "<exact column name>",
-  "y_col":      "<exact column name>",
-  "title":      "<concise descriptive title>",
-  "x_label":    "<x-axis label>",
-  "y_label":    "<y-axis label>"
-}
 """
+
+    class ChartConfig(BaseModel):
+        chart_type: Literal["bar", "line", "pie", "scatter", "histogram"]
+        x_col: str = Field(description="Exact column name for the x-axis / labels.")
+        y_col: str = Field(description="Exact column name for the numeric values.")
+        title: str = Field(description="Concise descriptive chart title.")
+        x_label: str = Field(description="X-axis label.")
+        y_label: str = Field(description="Y-axis label.")
+
+    chart_configurator = fast_model.with_structured_output(ChartConfig)
 
     def chart_config(state: AgentState) -> dict:
         rows = state.get("sql_rows", [])
         columns = state.get("sql_columns", [])
         sql = state.get("last_sql", "")
+
+        if not rows:
+            logger.info("chart_config: no rows to plot, skipping")
+            return {"chart_config": None}
 
         # Get user question and agent answer from messages
         user_q, agent_ans = "", ""
@@ -356,21 +357,15 @@ Rows ({len(rows)} total, showing up to 15): {sample}
 
 Agent answer: {agent_ans}
 
-Decide the best chart config and return JSON."""
+Decide the best chart config."""
 
         try:
-            raw = fast_model.invoke(
+            cfg = chart_configurator.invoke(
                 [
                     {"role": "system", "content": CHART_CONFIG_SYSTEM},
                     {"role": "user", "content": prompt},
                 ]
-            ).content.strip()
-
-            # Strip code fences if model adds them
-            raw = re.sub(
-                r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE
-            ).strip()
-            cfg = json.loads(raw)
+            ).model_dump()
             logger.info(f"chart_config: {cfg}")
             return {"chart_config": cfg}
 
