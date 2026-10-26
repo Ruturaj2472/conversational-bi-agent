@@ -1,0 +1,19 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# MLflow local runs
+mlruns/
+mlartifacts/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
