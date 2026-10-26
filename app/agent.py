@@ -145,6 +145,8 @@ Return two things:
 - Resolve pronouns (it, they, that, those) using the conversation history.
 - Expand follow-ups ("what about X?", "and for Y?") into full standalone questions.
 - Replace vague references ("the top one", "that genre") with actual values from history.
+- If the question refers to something that is NOT in the history, return it unchanged.
+  Never invent what a reference points to.
 - Never answer the question — only rewrite it.
 
 2. wants_chart — true if the user wants a chart/graph/visualisation:
@@ -241,7 +243,10 @@ Rules:
 - NEVER show SQL query text in your answer — the system surfaces it separately.
 - NEVER include code blocks, markdown, or raw SQL in the answer text.
 - Write only what a business user wants to read.
-- Limit results to at most {settings.max_results} rows unless user specifies.
+- For top-N / ranking questions, return the N the user asked for (default {settings.max_results}).
+- For questions asking which items match a condition, return ALL matching rows
+  (the system caps results at {MAX_FETCH_ROWS} rows). If the tool result says rows
+  were cut off, tell the user how many matched in total.
 - Order by the most relevant column.
 - NEVER run DML statements (INSERT, UPDATE, DELETE, DROP, TRUNCATE).
 - Before running a query, check it for common mistakes: NOT IN with NULLs,
@@ -249,6 +254,8 @@ Rules:
   wrong argument counts, incorrect casts, and wrong join columns.
 - Run one query at a time. If a query returns an error, fix it and try again.
 - If the question cannot be answered from the available data, say so clearly.
+- If the question depends on earlier context that is missing (e.g. "those products"
+  with no previous conversation), do not run a query or guess — ask the user to clarify.
 """
 
     CHART_GENERATE_ADDITION = """
@@ -259,6 +266,10 @@ CHART MODE — the user wants a visualisation:
     → Do NOT just return COUNT(*). Instead return a meaningful breakdown, e.g.:
        artists grouped by number of albums, genres by track count, etc.
 - Prefer GROUP BY queries that produce multiple rows for interesting visual breakdowns.
+- For "which X has the highest/most/lowest ..." questions, return ALL groups ordered
+  by the value, so the chart shows the comparison; name the top one in your answer.
+- For distributions / proportions (pie charts), include every group — do not LIMIT,
+  otherwise the percentages are wrong.
 - After your text answer, append exactly this token on its own line: CHART_REQUEST
 """
 
@@ -321,7 +332,8 @@ Chart types available: bar, line, pie, scatter, histogram
 Guidelines:
 - bar:       Best for comparisons between categories. Use when x is categorical, y is numeric.
 - line:      Best for trends over time. Use when x is ordered/temporal, y is numeric.
-- pie:       Best for proportions. Use only when there are ≤ 12 categories and they sum to a whole.
+- pie:       Best for proportions. Use only when there are ≤ 12 categories and the rows cover
+             the whole (no top-N cut-off).
 - scatter:   Best for correlation between two numeric variables.
 - histogram: Best for showing distribution of a single numeric column.
 
@@ -330,6 +342,8 @@ Special case — single row / scalar result:
 - Never refuse to produce a chart config.
 
 x_col and y_col MUST be exact column names from the provided columns list.
+y_col must be a numeric column whenever one exists. If no column is numeric, set y_col
+to the categorical column to count (the renderer will plot counts per value).
 """
 
     class ChartConfig(BaseModel):
