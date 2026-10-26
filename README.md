@@ -11,13 +11,14 @@ A full-stack BI agent that lets you query your database in plain English, get cl
 3. [Tech Stack](#3-tech-stack)
 4. [Project Structure](#4-project-structure)
 5. [Agent Graph](#5-agent-graph)
-6. [Prerequisites](#6-prerequisites)
-7. [Database Setup & Data Load](#7-database-setup--data-load)
-8. [Running Locally](#8-running-locally)
-9. [Running with Docker](#9-running-with-docker)
+6. [Performance](#6-performance)
+7. [Prerequisites](#7-prerequisites)
+8. [Running with Docker](#8-running-with-docker)
+9. [Running Locally (without Docker)](#9-running-locally-without-docker)
 10. [Environment Variables](#10-environment-variables)
 11. [API Reference](#11-api-reference)
-12. [Example Questions](#12-example-questions)
+12. [Testing](#12-testing)
+13. [Example Questions](#13-example-questions)
 
 ---
 
@@ -34,12 +35,13 @@ This system lets business users ask natural language questions about their data 
 
 | Capability | Details |
 |---|---|
-| Natural language to SQL | LangGraph agent writes, checks, and executes SQL |
+| Natural language to SQL | LangGraph agent writes and executes SQL, and fixes its own query when the database returns an error |
+| Read-only execution | Agent SQL runs in a read-only transaction with a statement timeout |
 | Conversational memory | PostgreSQL-backed, persists across sessions |
-| Query rewriting | Resolves pronouns and follow-ups using history |
-| Chart intent detection | Detects when user wants a chart, even implicitly |
-| AI chart configuration | LLM picks chart type and axes from actual result data |
-| MLflow tracing | Every node, LLM call, and SQL execution is traced |
+| Query rewriting + chart intent | One structured-output call resolves follow-ups ("that category" → "Beverages") and decides whether a chart helps |
+| Clarifying questions | Asks the user to clarify instead of guessing when a question refers to context that doesn't exist |
+| AI chart configuration | LLM picks chart type and axes from the actual result rows (structured output) |
+| MLflow tracing | Every question is logged as a run; every LLM call is traced with tokens and cost |
 
 ---
 
@@ -58,12 +60,8 @@ This system lets business users ask natural language questions about their data 
                     │   ┌──────────────────────────┐   │
                     │   │    LangGraph SQL Agent   │   │
                     │   │                          │   │
-                    │   │  query_rewriter          │   │
-                    │   │  intent_detector         │   │
-                    │   │  list_tables             │   │
-                    │   │  call_get_schema         │   │
+                    │   │  analyze_question        │   │
                     │   │  generate_query          │   │
-                    │   │  check_query             │   │
                     │   │  run_query               │   │
                     │   │  chart_config            │   │
                     │   └──────────────────────────┘   │
@@ -74,12 +72,14 @@ This system lets business users ask natural language questions about their data 
            │  Business DB       │     │  Memory DB          │
            │  (northwind)       │     │  (agent_memory)     │
            └───────────────────┘     └────────────────────┘
-                                              
+
                     ┌─────────────────────────┐
                     │   MLflow Tracking        │
                     │  (http://localhost:5000) │
                     └─────────────────────────┘
 ```
+
+With Docker Compose, all of these — PostgreSQL, MLflow, the FastAPI backend and the Streamlit UI — run as containers.
 
 ---
 
@@ -88,47 +88,54 @@ This system lets business users ask natural language questions about their data 
 | Component | Technology |
 |---|---|
 | Agent Framework | LangGraph |
-| LLM | OpenAI GPT-4.1-mini |
-| Business Database | PostgreSQL (Northwind) |
+| LLM | OpenAI GPT-4o (SQL + answers) and GPT-4.1-mini (question analysis + chart config), both configurable |
+| Business Database | PostgreSQL 16 (Northwind) |
 | Conversation Memory | PostgreSQL via SQLAlchemy (custom, no LangGraph checkpointer) |
 | API Layer | FastAPI |
-| Chart Generation | Matplotlib + Pandas |
+| Chart Generation | Matplotlib (thread-safe `Figure` API) + Pandas |
 | Experiment Tracking | MLflow |
 | Frontend | Streamlit |
 | Containerisation | Docker + Docker Compose |
+| Tests | pytest |
 
 ---
 
 ## 4. Project Structure
 
 ```
-bi-agent/
+conversational-bi-agent/
 │
-├── streamlit_app.py          # Streamlit chat UI
+├── streamlit_app.py            # Streamlit chat UI
 │
 ├── app/
-│   ├── main.py               # FastAPI app — endpoints /chat /chart /history
-│   ├── agent.py              # LangGraph agent — all 8 nodes + run_agent()
-│   ├── memory.py             # SQLAlchemy conversation store
-│   └── config.py             # Pydantic settings — reads from .env
+│   ├── main.py                 # FastAPI app — endpoints /chat /chart /history /tables /health
+│   ├── agent.py                # LangGraph agent — 4 nodes + run_agent()
+│   ├── sql_runner.py           # Read-only SQL execution, returns real columns + rows
+│   ├── memory.py               # SQLAlchemy conversation store
+│   └── config.py               # Pydantic settings — reads from .env
 │
 ├── charts/
-│   └── generator.py          # Pure chart renderer — takes rows + config → PNG
+│   └── generator.py            # Pure chart renderer — takes rows + config → PNG
 │
-├── mlflow/
-│   └── tracker.py            # Async-safe MLflow RunTracker
+├── mlflow_track/
+│   └── tracker.py              # Non-blocking MLflow run tracker
 │
 ├── scripts/
-│   ├── load_northwind.py     # ✅ Recommended: loads Northwind into Postgres
-│   ├── load_chinook.py       # Alternative: Chinook music store DB
-│   ├── load_adventureworks.py # Alternative: Adventure Works (complex)
-│   └── test_agent.py         # CLI smoke test for the agent
+│   ├── load_northwind.py       # Loads Northwind into Postgres (used by Docker Compose)
+│   └── load_chinook.py         # Alternative: Chinook music store DB
 │
-├── Dockerfile                # FastAPI container
-├── Dockerfile.streamlit      # Streamlit container
-├── docker-compose.yml        # All services (agent + streamlit + mlflow)
-├── requirements.txt          # Python dependencies
-└── .env.example              # Environment variable template
+├── tests/                      # pytest suite (no OpenAI key or Postgres needed)
+│
+├── docker/postgres/
+│   └── 01-create-memory-db.sh  # Creates the agent_memory DB on first Postgres start
+│
+├── Dockerfile                  # FastAPI container (also used for MLflow and the data loader)
+├── Dockerfile.streamlit        # Streamlit container
+├── docker-compose.yml          # Full stack: postgres, db-loader, mlflow, bi-agent, bi-ui
+├── requirements.txt            # API dependencies (pinned)
+├── requirements-ui.txt         # Streamlit UI dependencies (pinned)
+├── requirements-dev.txt        # Everything + pytest, black
+└── .env.example                # Environment variable template
 ```
 
 ---
@@ -141,147 +148,164 @@ Every user message flows through this LangGraph pipeline:
 START
   │
   ▼
-[query_rewriter]      Rewrites ambiguous follow-ups into self-contained questions
-  │                   using conversation history. E.g. "what about that one?"
-  │                   → "What is the total revenue for the Beverages category?"
+[analyze_question]    One structured-output call on the fast model (gpt-4.1-mini) that:
+  │                   - rewrites follow-ups into self-contained questions using history,
+  │                     e.g. "how many products are in that category?"
+  │                     → "How many products are in the Beverages category?"
+  │                   - decides wants_chart, from explicit ("show me a bar chart") or
+  │                     implied intent ("compare sales by region")
   ▼
-[intent_detector]     Classifies whether the user wants a chart (YES/NO).
-  │                   Detects explicit ("show me a bar chart") and implied intent
-  │                   ("compare sales by region" → chart useful → YES).
-  ▼
-[list_tables]         Forced tool call — lists all available DB tables.
-  │
-  ▼
-[call_get_schema]     Forces schema retrieval for relevant tables.
-  │
-  ▼
-[get_schema]          ToolNode — executes the schema call.
-  │
-  ▼
-[generate_query]      Writes SQL + natural language answer.
+[generate_query]      Writes SQL + the natural language answer (gpt-4o).
+  │                   The full database schema (tables, columns, sample rows) is loaded
+  │                   once at startup and placed at the start of the system prompt, so
+  │                   OpenAI's prompt cache reuses it across requests.
+  │                   Sees only the current (rewritten) question, not the whole history.
   │                   In CHART MODE: writes a GROUP BY query returning ≥2 columns.
-  │                   Appends CHART_REQUEST token if chart is needed.
   │
-  ├── (tool call) ──► [check_query] ──► [run_query] ──► back to [generate_query]
-  │                    SQL expert         Executes SQL,
-  │                    double-checks      captures rows +
-  │                    the query          columns into state
+  ├── (tool call) ──► [run_query] ──► back to [generate_query]
+  │                    Executes the SQL in a read-only transaction and stores the real
+  │                    column names + rows in state. Database errors are returned to
+  │                    generate_query, which fixes the query and retries
+  │                    (capped by the graph's recursion limit).
   │
   └── (final answer)
           │
           ├── wants_chart=True  ──► [chart_config] ──► END
-          │                         gpt-4.1-mini decides:
-          │                         chart_type, x_col, y_col,
-          │                         title, labels — from actual rows
+          │                         gpt-4.1-mini decides chart_type, x_col, y_col,
+          │                         title and labels from the actual rows
+          │                         (skipped when the query returned no rows)
           │
           └── wants_chart=False ──► END
 ```
 
+LLM calls per question: **2** (plain question) to **4** (chart question), plus 1 per SQL retry.
+
 **Memory flow (outside the graph):**
-- Before: history loaded from `agent_memory` DB → prepended to messages
-- After: user question + final answer saved to `agent_memory` DB
+- Before: the last `HISTORY_MESSAGES` messages are loaded from the `agent_memory` DB (long answers truncated to `HISTORY_MAX_CHARS`)
+- After: the user question and final answer are saved to `agent_memory` in one transaction
 
 ---
 
-## 6. Prerequisites
+## 6. Performance
 
-- Python 3.11+
-- PostgreSQL 14+ running locally
-- Docker + Docker Compose (for Docker option)
+Measured end to end on the Docker stack (PostgreSQL 16 + Northwind) with the 11 questions in `example_queries.txt`, comparing the original version of this project (commit `4c85659`) with the current one. Both used the same database, the same library versions and the same models (gpt-4o + gpt-4.1-mini). LLM calls, tokens and cost come from MLflow traces; answers were checked against the database.
+
+| Metric | Original | Current |
+|---|---|---|
+| Average response time | 8.1 s | **5.4 s** (−33%) |
+| Median / p95 response time | 7.9 s / 10.6 s | **5.5 s / 7.3 s** |
+| LLM calls (11 questions) | 62 | **37** (−40%) |
+| gpt-4o calls | 59 | **20** (−66%) |
+| LLM calls per question | 5–7 | **2–4** |
+| Output tokens | 2,800 | **1,954** (−30%) |
+| Input tokens served from prompt cache | 14% | **85%** |
+| Correct and complete answers | 7 / 11 | **11 / 11** |
+| Charts produced for chart questions | 2 / 7 | **6 / 7** |
+| OpenAI cost per question | $0.0094 | $0.0105 |
+
+**Cost trade-off:** the current version sends the full schema (14 tables, ~2,700 tokens) with every gpt-4o call instead of looking up only the relevant tables with an extra LLM call. That removes round trips — which is where the latency gain comes from — but adds input tokens. Most of them are served from OpenAI's prompt cache at a discount, and the result is about $0.001 more per question. For much larger schemas, selecting relevant tables first (e.g. by keyword or embedding search) would keep the prompt small without adding an LLM call.
+
+These figures come from one run of 11 questions per version; LLM latency varies between runs, so treat percentages as approximate.
+
+---
+
+## 7. Prerequisites
+
+- Docker Desktop (includes Docker Compose) — for the Docker option
+- Python 3.11+ and PostgreSQL 14+ — only for running without Docker
 - OpenAI API key
 
 ---
 
-## 7. Database Setup & Data Load
+## 8. Running with Docker
 
-Two PostgreSQL databases are needed:
+Docker Compose runs the whole stack: PostgreSQL, a one-off Northwind loader, MLflow, the FastAPI backend and the Streamlit UI.
 
-| Database | Purpose |
+### Step 1 — Configure `.env`
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` and set at least:
+
+```env
+OPENAI_API_KEY=sk-your-key-here
+POSTGRES_PASSWORD=choose-a-password
+```
+
+Hosts are set by `docker-compose.yml` — you don't need to change `POSTGRES_HOST` or `MLFLOW_TRACKING_URI`.
+
+### Step 2 — Build and start
+
+```bash
+docker compose up --build
+```
+
+On first start:
+1. `postgres` creates the `northwind` and `agent_memory` databases
+2. `db-loader` downloads Northwind and loads it, then exits
+3. `mlflow` and `bi-agent` start; `bi-ui` starts once the API is healthy
+
+The first build takes a few minutes. Later starts are fast, and data persists in Docker volumes.
+
+### Step 3 — Access services
+
+| Service | URL |
 |---|---|
-| `northwind` | Business data (products, orders, suppliers, customers) |
-| `agent_memory` | Conversation history (auto-created by the app on startup) |
+| Streamlit UI | http://localhost:8501 |
+| FastAPI | http://localhost:8000 |
+| API Docs (Swagger) | http://localhost:8000/docs |
+| MLflow UI | http://localhost:5000 |
+| PostgreSQL | `localhost:5432` (user/password from `.env`) |
 
-### Step 1 — Create the databases
-
-```bash
-psql -U postgres -c "CREATE DATABASE northwind;"
-psql -U postgres -c "CREATE DATABASE agent_memory;"
-```
-
-### Step 2 — Load Northwind data
-
-The loader script downloads the Northwind SQL file from GitHub and loads it into PostgreSQL automatically.
+### Docker management commands
 
 ```bash
-# Install loader dependencies if not already installed
-pip install requests psycopg2-binary python-dotenv
+# Start all services (background)
+docker compose up -d
 
-# Run the loader
-python scripts/load_northwind.py
+# Container status
+docker compose ps
+
+# View live logs
+docker compose logs -f
+docker compose logs -f bi-agent
+
+# Rebuild and restart one service after a code change
+docker compose up -d --build bi-agent
+
+# Query the business database
+docker exec -it bi-postgres psql -U postgres -d northwind
+
+# Stop all
+docker compose down
+
+# Stop and delete all data (Postgres + MLflow volumes)
+docker compose down -v
 ```
 
-Expected output:
+### How containers communicate
+
 ```
-INFO | Database 'northwind' already exists.
-INFO | Downloading Northwind SQL from GitHub...
-INFO |   ✓ Downloaded (84 KB)
-INFO | Loading Northwind into 'northwind'...
-INFO |   ✓ All statements executed.
-
-INFO | Tables created:
-INFO |   categories                        8 rows
-INFO |   customers                        91 rows
-INFO |   employee_territories             49 rows
-INFO |   employees                         9 rows
-INFO |   order_details                  2155 rows
-INFO |   orders                           830 rows
-INFO |   products                          77 rows
-INFO |   regions                            4 rows
-INFO |   shippers                           3 rows
-INFO |   suppliers                         29 rows
-INFO |   territories                       53 rows
-
-INFO | ✅ Northwind loaded successfully!
+bi-ui      ──► bi-agent:8000      (FastAPI)
+bi-agent   ──► postgres:5432      (northwind + agent_memory)
+bi-agent   ──► mlflow:5000        (tracking)
+db-loader  ──► postgres:5432      (one-off data load)
 ```
-
-### Step 3 — Verify
-
-```bash
-psql -U postgres -d northwind -c "\dt"
-psql -U postgres -d northwind -c "SELECT COUNT(*) FROM orders;"
-```
-
-### About the databases
-
-**Northwind** is the business database — all tables land in the `public` schema:
-
-| Table | Description |
-|---|---|
-| `products` | Product catalogue, prices, stock levels, reorder points |
-| `categories` | Product categories (Beverages, Condiments, Seafood, etc.) |
-| `suppliers` | Vendor information, country, contact |
-| `orders` | Sales orders with dates, freight, ship info |
-| `order_details` | Line items — product, quantity, unit price, discount |
-| `customers` | Customer info, city, country |
-| `employees` | Staff, territory, hire date |
-| `shippers` | Shipping companies |
-
-**agent_memory** is managed entirely by the app. The table `conversation_messages` is created automatically on first startup.
 
 ---
 
-## 8. Running Locally
+## 9. Running Locally (without Docker)
 
-### Step 1 — Clone and install
+### Step 1 — Install
 
 ```bash
-cd to the zip folder
-
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 
 pip install -r requirements.txt
-pip install streamlit pillow     # extra deps for the UI
+pip install -r requirements-ui.txt
 ```
 
 ### Step 2 — Configure environment
@@ -296,18 +320,41 @@ OPENAI_API_KEY=sk-your-key-here
 POSTGRES_HOST=localhost
 POSTGRES_PASSWORD=yourpassword
 POSTGRES_DB=northwind
-MEMORY_POSTGRES_PASSWORD=yourpassword
 ```
 
-### Step 3 — Start MLflow
+`MEMORY_POSTGRES_*` values that are not set fall back to the `POSTGRES_*` values.
+
+### Step 3 — Create the databases and load Northwind
 
 ```bash
-set MLFLOW_SERVER_ALLOWED_HOSTS=*
-mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri sqlite:///mlflow.db --default-artifact-root /mlflow/artifacts
-# Open http://localhost:5000
+psql -U postgres -c "CREATE DATABASE agent_memory;"
+python scripts/load_northwind.py     # creates 'northwind' if needed and loads it
 ```
 
-### Step 4 — Start the FastAPI backend
+Expected output (end):
+```
+INFO | Tables created:
+INFO |   categories                          8 rows
+INFO |   customers                          91 rows
+INFO |   order_details                    2155 rows
+INFO |   orders                            830 rows
+INFO |   products                           77 rows
+INFO |   suppliers                          29 rows
+INFO |   ...
+INFO | ✅ Northwind loaded successfully!
+```
+
+The table `conversation_messages` in `agent_memory` is created automatically when the API starts.
+
+### Step 4 — Start MLflow (optional)
+
+```bash
+mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri sqlite:///mlflow.db
+```
+
+If MLflow is not running, tracking is skipped and the app works normally.
+
+### Step 5 — Start the FastAPI backend
 
 ```bash
 uvicorn app.main:app --reload --port 8000
@@ -316,11 +363,12 @@ uvicorn app.main:app --reload --port 8000
 You should see:
 ```
 INFO | DB: dialect=postgresql tables=['categories', 'customers', ...]
-INFO | Agent compiled: rewriter→intent→tables→schema→generate...
-INFO | ✅ Agent ready.
+INFO | Schema loaded: 14 tables, ... chars
+INFO | Agent compiled: analyze→generate⇄[run]→[chart]→END
+INFO | Agent ready.
 ```
 
-### Step 5 — Start the Streamlit UI
+### Step 6 — Start the Streamlit UI
 
 Open a second terminal:
 ```bash
@@ -328,122 +376,22 @@ streamlit run streamlit_app.py
 # Opens http://localhost:8501
 ```
 
-### Local service URLs
+### About the databases
 
-| Service | URL |
+**Northwind** is the business database — all tables are in the `public` schema:
+
+| Table | Description |
 |---|---|
-| Streamlit UI | http://localhost:8501 |
-| FastAPI | http://localhost:8000 |
-| API Docs (Swagger) | http://localhost:8000/docs |
-| MLflow UI | http://localhost:5000 |
+| `products` | Product catalogue, prices, stock levels, reorder points |
+| `categories` | Product categories (Beverages, Condiments, Seafood, etc.) |
+| `suppliers` | Vendor information, country, contact |
+| `orders` | Sales orders with dates, freight, ship info |
+| `order_details` | Line items — product, quantity, unit price, discount |
+| `customers` | Customer info, city, country |
+| `employees` | Staff, territory, hire date |
+| `shippers` | Shipping companies |
 
----
-
-## 9. Running with Docker
-
-PostgreSQL stays on your **local machine** (outside Docker). The three containers — FastAPI, Streamlit, MLflow — run inside Docker and connect to your local Postgres via `host.docker.internal`.
-
-### Step 1 — Make sure databases are loaded
-
-Follow [Section 7](#7-database-setup--data-load) first. The databases must exist on your local Postgres before starting Docker.
-
-### Step 2 — Configure `.env`
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env` — use `host.docker.internal` as the Postgres host so containers can reach your local machine:
-
-```env
-OPENAI_API_KEY=sk-your-key-here
-POSTGRES_HOST=host.docker.internal
-POSTGRES_PASSWORD=yourpassword
-POSTGRES_DB=northwind
-MEMORY_POSTGRES_HOST=host.docker.internal
-MEMORY_POSTGRES_PASSWORD=yourpassword
-MLFLOW_TRACKING_URI=http://mlflow:5000
-```
-
-### Step 3 — Linux only: allow Docker to connect to local Postgres
-
-On **Mac and Windows**, Docker Desktop handles `host.docker.internal` automatically — skip this step.
-
-On **Linux**, you need to:
-
-**a) Allow external connections in `postgresql.conf`:**
-```bash
-# Find your config file
-psql -U postgres -c "SHOW config_file;"
-
-# Add or update this line
-listen_addresses = '*'
-```
-
-**b) Allow the Docker subnet in `pg_hba.conf`:**
-```
-host    all    all    172.16.0.0/12    md5
-```
-
-**c) Restart PostgreSQL:**
-```bash
-sudo systemctl restart postgresql
-```
-
-```bash
-set MLFLOW_SERVER_ALLOWED_HOSTS=*
-mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri sqlite:///mlflow.db --default-artifact-root /mlflow/artifacts
-# Open http://localhost:5000
-```
-
-### Step 4 — Build and start
-
-```bash
-docker-compose up --build
-```
-
-First build takes 2–3 minutes. Subsequent starts are fast.
-
-### Step 5 — Access services
-
-| Service | URL |
-|---|---|
-| FastAPI | http://localhost:8000 |
-| API Docs | http://localhost:8000/docs |
-
-### Docker management commands
-
-```bash
-# Start all services (background)
-docker-compose up -d
-
-# Start with rebuild (after code changes)
-docker-compose up --build
-
-# View live logs
-docker-compose logs -f
-
-# View logs for one service
-docker-compose logs -f bi-agent
-docker-compose logs -f streamlit
-docker-compose logs -f mlflow
-
-# Restart one service after code change
-docker-compose up --build bi-agent
-
-# Stop all
-docker-compose down
-
-# Stop and wipe MLflow data
-docker-compose down -v
-```
-
-### How containers communicate
-
-```
-bi-agent   ──► host.docker.internal:5432   (your local Postgres)
-bi-agent   ──► mlflow:5000        (internal Docker network)
-```
+**agent_memory** is managed entirely by the app.
 
 ---
 
@@ -451,21 +399,26 @@ bi-agent   ──► mlflow:5000        (internal Docker network)
 
 | Variable | Default | Description |
 |---|---|---|
-| `OPENAI_API_KEY` | *(required)* | Your OpenAI API key |
-| `POSTGRES_HOST` | `localhost` | Business DB host. Use `host.docker.internal` in Docker |
+| `OPENAI_API_KEY` | *(required)* | Your OpenAI API key — the app fails at startup if it is missing |
+| `POSTGRES_HOST` | `localhost` | Business DB host (set to `postgres` by Docker Compose) |
 | `POSTGRES_PORT` | `5432` | Business DB port |
 | `POSTGRES_USER` | `postgres` | Business DB user |
 | `POSTGRES_PASSWORD` | `postgres` | Business DB password |
 | `POSTGRES_DB` | `northwind` | Business DB name |
-| `MEMORY_POSTGRES_HOST` | `localhost` | Memory DB host |
-| `MEMORY_POSTGRES_PORT` | `5432` | Memory DB port |
-| `MEMORY_POSTGRES_USER` | `postgres` | Memory DB user |
-| `MEMORY_POSTGRES_PASSWORD` | `postgres` | Memory DB password |
+| `MEMORY_POSTGRES_HOST` | `POSTGRES_HOST` | Memory DB host |
+| `MEMORY_POSTGRES_PORT` | `POSTGRES_PORT` | Memory DB port |
+| `MEMORY_POSTGRES_USER` | `POSTGRES_USER` | Memory DB user |
+| `MEMORY_POSTGRES_PASSWORD` | `POSTGRES_PASSWORD` | Memory DB password |
 | `MEMORY_POSTGRES_DB` | `agent_memory` | Memory DB name |
-| `MLFLOW_TRACKING_URI` | `http://localhost:5000` | MLflow server URL |
+| `MLFLOW_TRACKING_URI` | `http://mlflow:5000` | MLflow server URL (use `http://localhost:5000` locally) |
 | `MLFLOW_EXPERIMENT_NAME` | `bi-agent` | MLflow experiment name |
-| `MODEL_NAME` | `gpt-4.1-mini` | OpenAI model for the agent |
-| `MAX_RESULTS` | `10` | Max SQL result rows returned |
+| `MODEL_NAME` | `gpt-4.1-mini` | Model for SQL generation and answers (`.env.example` uses `gpt-4o`) |
+| `FAST_MODEL_NAME` | `gpt-4.1-mini` | Model for question analysis and chart config |
+| `MAX_RESULTS` | `10` | Default N for top-N / ranking questions |
+| `QUERY_TIMEOUT_SECONDS` | `30` | PostgreSQL statement timeout for agent queries |
+| `HISTORY_MESSAGES` | `10` | Past messages used to resolve follow-up questions |
+| `HISTORY_MAX_CHARS` | `500` | Longer past answers are truncated in the prompt |
+| `API_BASE_URL` | `http://localhost:8000` | Streamlit UI → API address (set by Docker Compose) |
 | `DEBUG` | `false` | Enable SQLAlchemy SQL echo |
 
 ---
@@ -487,14 +440,14 @@ Main endpoint — returns answer + SQL + optional chart.
 ```json
 {
   "answer": "The top 5 products by revenue are Côte de Blaye ($141,396), ...",
-  "sql": "SELECT p.ProductName, SUM(od.UnitPrice * od.Quantity) ...",
+  "sql": "SELECT p.product_name, SUM(od.unit_price * od.quantity * (1 - od.discount)) AS revenue ...",
   "session_id": "user-abc123",
-  "rewritten_question": "Show top 5 products by revenue as a bar chart",
+  "rewritten_question": "Show the top 5 products by revenue as a bar chart",
   "wants_chart": true,
   "chart": {
     "chart_type": "bar",
     "title": "Top 5 Products by Revenue",
-    "x_col": "productname",
+    "x_col": "product_name",
     "y_col": "revenue",
     "rows": 5,
     "image_base64": "iVBORw0KGgoAAAANS..."
@@ -506,7 +459,7 @@ Main endpoint — returns answer + SQL + optional chart.
 Text answer + SQL only — no chart generation.
 
 ### `GET /history/{session_id}`
-Returns full conversation history for a session.
+Returns conversation history for a session (`?limit=50` by default).
 
 ### `DELETE /history/{session_id}`
 Clears conversation history for a session.
@@ -518,3 +471,42 @@ Lists all available tables in the connected database.
 Health check — returns model name and version.
 
 ---
+
+## 12. Testing
+
+The test suite runs without an OpenAI key or PostgreSQL: it uses SQLite and a scripted fake LLM to run the full LangGraph agent.
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+| File | Covers |
+|---|---|
+| `tests/test_config.py` | Defaults, memory-DB fallback, URL escaping, required API key |
+| `tests/test_sql_runner.py` | Real column names, row cap, errors, rollback, type conversion |
+| `tests/test_memory.py` | Ordered batch writes, latest-N history, truncation, clearing |
+| `tests/test_charts.py` | Every chart type, non-numeric values, date labels, concurrent rendering |
+| `tests/test_agent_graph.py` | End-to-end graph runs: chart flow, schema in prompt, SQL retry, retry cap, empty results |
+
+---
+
+## 13. Example Questions
+
+From `example_queries.txt` (questions in the same group share a session, so follow-ups work):
+
+```
+Which category had the highest revenue?
+How many products are in that category?
+
+Which country has the most suppliers? Show as a pie chart
+Who are the top 5 employees by number of orders handled?
+
+Which products are below their reorder level? List them with current stock and reorder point
+
+Show me monthly order volume trend for 1997 as a line chart
+
+Which supplier provides the most expensive products on average?
+
+What are the top 3 most ordered products?
+```
