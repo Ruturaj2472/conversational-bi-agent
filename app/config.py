@@ -51,6 +51,7 @@ class Settings(BaseSettings):
     # Agent
     max_results: int = 10
     model_name: str = "gpt-4.1-mini"
+    fast_model_name: str = "gpt-4.1-mini"  # question analysis + chart config
     query_timeout_seconds: int = 30
 
     @model_validator(mode="after")
