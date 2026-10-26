@@ -53,6 +53,8 @@ class Settings(BaseSettings):
     model_name: str = "gpt-4.1-mini"
     fast_model_name: str = "gpt-4.1-mini"  # question analysis + chart config
     query_timeout_seconds: int = 30
+    history_messages: int = 10  # past messages used to resolve follow-ups
+    history_max_chars: int = 500  # longer past answers are truncated
 
     @model_validator(mode="after")
     def _default_memory_db_to_business_db(self) -> "Settings":

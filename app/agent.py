@@ -73,6 +73,24 @@ class AgentState(TypedDict):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _current_turn(messages: list) -> list:
+    """
+    Messages from the latest human question onward.
+
+    analyze_question has already rewritten that question to be self-contained,
+    so SQL generation does not need the earlier conversation.
+    """
+    for i in range(len(messages) - 1, -1, -1):
+        if getattr(messages[i], "type", None) == "human":
+            return messages[i:]
+    return messages
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # build_agent
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -251,7 +269,7 @@ CHART MODE — the user wants a visualisation:
         )
         system = {"role": "system", "content": system_content}
         llm = main_model.bind_tools([run_query_tool], parallel_tool_calls=False)
-        response = llm.invoke([system] + state["messages"])
+        response = llm.invoke([system] + _current_turn(state["messages"]))
         return {"messages": [response]}
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -433,7 +451,11 @@ async def run_agent(agent: Any, question: str, session_id: str) -> dict:
     """
     Run one agent turn. Returns answer, sql, chart_config, and metadata.
     """
-    history = get_history_as_langchain_messages(session_id, limit=20)
+    history = get_history_as_langchain_messages(
+        session_id,
+        limit=settings.history_messages,
+        max_chars=settings.history_max_chars,
+    )
     logger.info(f"[{session_id}] {len(history)} history msgs loaded.")
 
     initial: AgentState = {

@@ -199,6 +199,7 @@ def get_history(
 def get_history_as_langchain_messages(
     session_id: str,
     limit: int = 20,
+    max_chars: Optional[int] = None,
 ) -> list[BaseMessage]:
     """
     Fetch conversation history as LangChain HumanMessage / AIMessage objects,
@@ -207,6 +208,7 @@ def get_history_as_langchain_messages(
     Args:
         session_id: Conversation thread identifier.
         limit:      Maximum number of messages (default 20).
+        max_chars:  If set, assistant messages longer than this are truncated.
 
     Returns:
         Chronological list of BaseMessage objects.
@@ -214,10 +216,13 @@ def get_history_as_langchain_messages(
     history = get_history(session_id, limit=limit)
     messages: list[BaseMessage] = []
     for row in history:
+        content = row["content"]
         if row["role"] == "user":
-            messages.append(HumanMessage(content=row["content"]))
+            messages.append(HumanMessage(content=content))
         else:
-            messages.append(AIMessage(content=row["content"]))
+            if max_chars and len(content) > max_chars:
+                content = content[:max_chars] + "…"
+            messages.append(AIMessage(content=content))
     return messages
 
 
