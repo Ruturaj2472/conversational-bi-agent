@@ -119,8 +119,21 @@ def render_chart(rows: list, columns: list[str], config: dict) -> dict:
         y_col_resolved = df.columns[1] if len(df.columns) > 1 else df.columns[0]
         logger.warning(f"y_col '{y_col}' not found, using '{y_col_resolved}'")
 
-    x_data = df[x_col_resolved].astype(str)
-    y_data = pd.to_numeric(df[y_col_resolved], errors="coerce").fillna(0)
+    y_numeric = pd.to_numeric(df[y_col_resolved], errors="coerce")
+    if y_numeric.notna().any():
+        x_data = _format_labels(df[x_col_resolved])
+        y_data = y_numeric.fillna(0)
+    else:
+        # No numeric values: plot how many rows share each value of y_col
+        counts = df[y_col_resolved].astype(str).value_counts()
+        logger.info(f"y_col '{y_col_resolved}' is not numeric, plotting counts")
+        x_data = pd.Series(counts.index)
+        y_data = pd.Series(counts.values)
+        x_label = y_label or y_col_resolved
+        x_col_resolved, y_col_resolved, y_label = y_col_resolved, "count", "Count"
+        if chart_type in ("scatter", "histogram", "line"):
+            chart_type = "bar"
+        df = pd.DataFrame({x_col_resolved: x_data, y_col_resolved: y_data})
 
     # ── Render ────────────────────────────────────────────────────────────────
     try:
@@ -183,6 +196,22 @@ def render_chart(rows: list, columns: list[str], config: dict) -> dict:
 
 
 # ── Chart type renderers ──────────────────────────────────────────────────────
+
+
+def _format_labels(series: pd.Series) -> pd.Series:
+    """Readable axis labels; ISO date/time strings become e.g. 'Jan 1997'."""
+    labels = series.astype(str)
+    if not labels.str.match(r"^\d{4}-\d{2}-\d{2}").all():
+        return labels
+    parsed = pd.to_datetime(labels, errors="coerce", utc=True)
+    if parsed.isna().any():
+        return labels
+    midnight = (parsed.dt.hour == 0) & (parsed.dt.minute == 0)
+    if midnight.all() and (parsed.dt.day == 1).all():
+        return parsed.dt.strftime("%b %Y")
+    if midnight.all():
+        return parsed.dt.strftime("%Y-%m-%d")
+    return parsed.dt.strftime("%Y-%m-%d %H:%M")
 
 
 def _apply_theme(fig, ax):
