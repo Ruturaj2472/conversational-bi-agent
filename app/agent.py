@@ -5,24 +5,14 @@ Graph flow:
     START
       │
       ▼
-  [query_rewriter]     ← resolves follow-up references using history
-      │
+  [analyze_question]   ← one fast-model call: resolves follow-up references
+      │                  using history AND classifies if the user wants a chart
+      │                  (explicit or implied), sets state["wants_chart"]
       ▼
-  [intent_detector]    ← NEW: classifies if user wants a chart (explicit or implied)
-      │                        sets state["wants_chart"] = True/False
-      ▼
-  [list_tables]
+  [generate_query]     ← schema is in the system prompt (loaded once at startup);
+      │                  writes SQL query, stores it in state["last_sql"]
       │
-      ▼
-  [call_get_schema]
-      │
-      ▼
-  [get_schema]
-      │
-      ▼
-  [generate_query]     ← writes SQL query, stores it in state["last_sql"]
-      │
-      ├─(tool call)──► [check_query] ──► [run_query] ──► back to [generate_query]
+      ├─(tool call)──► [run_query] ──► back to [generate_query]
       │
       └─(final answer)
             │
@@ -39,10 +29,7 @@ State:
     chart_config  - LLM-decided chart config dict, or None
 """
 
-import ast
-import json
 import logging
-import re
 from typing import Annotated, Any, Literal, Optional
 
 from langchain.chat_models import init_chat_model
@@ -50,23 +37,26 @@ from langchain.messages import AIMessage, HumanMessage
 from langchain_community.utilities import SQLDatabase
 from langchain_community.agent_toolkits import SQLDatabaseToolkit
 from langchain_core.messages import ToolMessage
+from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode
+from pydantic import BaseModel, Field
+from sqlalchemy import create_engine
 from typing_extensions import TypedDict
-import mlflow
-
-mlflow.langchain.autolog()
-
-# Optional: Set a tracking URI and an experiment
 
 from app.config import get_settings
-from app.memory import get_history_as_langchain_messages, store_message
+from app.memory import get_history_as_langchain_messages, store_messages
+from app.sql_runner import execute_readonly
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
-mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
-mlflow.set_experiment(settings.mlflow_experiment_name)
+
+MAX_FETCH_ROWS = 100  # hard cap on rows fetched per query
+RECURSION_LIMIT = 12  # graph steps per turn; allows ~4 SQL attempts
+GIVE_UP_ANSWER = (
+    "I couldn't build a working query for that question. "
+    "Please try rephrasing it or making it more specific."
+)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # State
@@ -75,7 +65,7 @@ mlflow.set_experiment(settings.mlflow_experiment_name)
 
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
-    wants_chart: bool  # set by intent_detector
+    wants_chart: bool  # set by analyze_question
     last_sql: str  # last SQL query executed
     sql_rows: list  # raw result rows
     sql_columns: list[str]  # column names
@@ -87,40 +77,17 @@ class AgentState(TypedDict):
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-def _parse_sql_result(content: str) -> list:
-    """Parse sql_db_query output string into a list of row tuples."""
-    content = content.strip()
-    if not content or content.lower().startswith("error"):
-        return []
-    try:
-        rows = ast.literal_eval(content)
-        return rows if isinstance(rows, list) else []
-    except Exception:
-        return []
+def _current_turn(messages: list) -> list:
+    """
+    Messages from the latest human question onward.
 
-
-def _extract_columns(sql: str, n_cols: int) -> list[str]:
-    """Extract column alias names from SELECT clause. Falls back to col_0, col_1…"""
-    if n_cols == 0:
-        return []
-    try:
-        m = re.search(r"SELECT\s+(.+?)\s+FROM", sql, re.IGNORECASE | re.DOTALL)
-        if not m:
-            return [f"col_{i}" for i in range(n_cols)]
-        parts = m.group(1).split(",")
-        names = []
-        for p in parts:
-            alias = re.search(r"\bAS\s+[\"'`]?(\w+)[\"'`]?", p, re.IGNORECASE)
-            if alias:
-                names.append(alias.group(1).lower())
-            else:
-                token = p.strip().split()[-1].strip("\"'`").lower()
-                names.append(token or f"col_{len(names)}")
-        while len(names) < n_cols:
-            names.append(f"col_{len(names)}")
-        return names[:n_cols]
-    except Exception:
-        return [f"col_{i}" for i in range(n_cols)]
+    analyze_question has already rewritten that question to be self-contained,
+    so SQL generation does not need the earlier conversation.
+    """
+    for i in range(len(messages) - 1, -1, -1):
+        if getattr(messages[i], "type", None) == "human":
+            return messages[i:]
+    return messages
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -134,40 +101,74 @@ def build_agent() -> tuple[Any, SQLDatabase]:
     main_model = init_chat_model(
         settings.model_name, model_provider="openai", temperature=0
     )
-    chart_model = init_chat_model(
-        "gpt-4.1-mini", model_provider="openai", temperature=0
+    fast_model = init_chat_model(
+        settings.fast_model_name, model_provider="openai", temperature=0
     )
 
     # ── DB ────────────────────────────────────────────────────────────────────
-    db = SQLDatabase.from_uri(settings.business_db_url, sample_rows_in_table_info=3)
-    logger.info(f"DB: dialect={db.dialect} tables={db.get_usable_table_names()}")
+    engine = create_engine(
+        settings.business_db_url,
+        pool_pre_ping=True,
+        connect_args={
+            "options": f"-c statement_timeout={settings.query_timeout_seconds * 1000}"
+        },
+    )
+    db = SQLDatabase(engine, sample_rows_in_table_info=3)
+    tables = db.get_usable_table_names()
+    logger.info(f"DB: dialect={db.dialect} tables={tables}")
+
+    # Schema (CREATE TABLE statements + sample rows) is loaded once at startup
+    # and embedded in the system prompt. Restart the app after schema changes.
+    schema_info = db.get_table_info()
+    logger.info(f"Schema loaded: {len(tables)} tables, {len(schema_info)} chars")
 
     # ── Tools ─────────────────────────────────────────────────────────────────
     toolkit = SQLDatabaseToolkit(db=db, llm=main_model)
-    tools = toolkit.get_tools()
-    get_schema_tool = next(t for t in tools if t.name == "sql_db_schema")
-    run_query_tool = next(t for t in tools if t.name == "sql_db_query")
-    list_tables_tool = next(t for t in tools if t.name == "sql_db_list_tables")
-    get_schema_node = ToolNode([get_schema_tool], name="get_schema")
+    run_query_tool = next(t for t in toolkit.get_tools() if t.name == "sql_db_query")
 
     # ══════════════════════════════════════════════════════════════════════════
-    # NODE 1 — query_rewriter
-    # Rewrites follow-up questions to be self-contained using history.
+    # NODE 1 — analyze_question
+    #
+    # One structured-output call on the fast model that both:
+    #   - rewrites follow-up questions to be self-contained using history
+    #   - decides wants_chart, either
+    #       A) EXPLICIT — user says "chart", "graph", "plot", "visualise", etc.
+    #       B) IMPLIED  — a comparison/trend/distribution question where a
+    #                     chart would naturally help
     # ══════════════════════════════════════════════════════════════════════════
-    REWRITER_SYSTEM = """You are a query-rewriting assistant for a conversational BI system.
+    ANALYZE_SYSTEM = """You analyse the user's latest question for a conversational BI system.
 
-Rewrite the user's latest question into a fully self-contained, unambiguous question.
+Return two things:
 
-Rules:
-- If already self-contained, output it unchanged.
-- Resolve pronouns (it, they, that, those) using history.
+1. rewritten_question — the latest question as a fully self-contained, unambiguous question.
+- If already self-contained, return it unchanged.
+- Resolve pronouns (it, they, that, those) using the conversation history.
 - Expand follow-ups ("what about X?", "and for Y?") into full standalone questions.
 - Replace vague references ("the top one", "that genre") with actual values from history.
+- If the question refers to something that is NOT in the history, return it unchanged.
+  Never invent what a reference points to.
 - Never answer the question — only rewrite it.
-- Output ONLY the rewritten question. No preamble.
+
+2. wants_chart — true if the user wants a chart/graph/visualisation:
+- true if the user explicitly mentions: chart, graph, plot, visualise, visualize, bar, pie,
+  line chart, histogram, scatter, diagram, show me a graph, draw, display as chart
+- true if the user asks for a comparison, trend, distribution, ranking, or breakdown where
+  a chart would clearly be the most useful output
+- false for simple factual questions (how many, what is, who, when, list)
+- false if the user wants a text answer or table, or the question is conversational
 """
 
-    def query_rewriter(state: AgentState) -> dict:
+    class QuestionAnalysis(BaseModel):
+        rewritten_question: str = Field(
+            description="The latest question rewritten to be self-contained."
+        )
+        wants_chart: bool = Field(
+            description="Whether a chart should be produced for this question."
+        )
+
+    analyzer = fast_model.with_structured_output(QuestionAnalysis)
+
+    def analyze_question(state: AgentState) -> dict:
         messages = state["messages"]
         last_human_idx = next(
             (
@@ -178,123 +179,60 @@ Rules:
             None,
         )
         if last_human_idx is None:
-            return {}
+            return {"wants_chart": False}
 
-        original = messages[last_human_idx].content
-        has_history = any(
-            getattr(m, "type", None) in ("human", "ai")
+        last_human = messages[last_human_idx]
+        original = last_human.content if isinstance(last_human.content, str) else ""
+        history_lines = [
+            f"{'User' if m.type == 'human' else 'Assistant'}: {m.content}"
             for m in messages[:last_human_idx]
-        )
-        if not has_history:
-            return {}
-
-        prompt = [{"role": "system", "content": REWRITER_SYSTEM}] + [
-            {
-                "role": "user" if getattr(m, "type", None) == "human" else "assistant",
-                "content": m.content if isinstance(m.content, str) else str(m.content),
-            }
-            for m in messages
             if getattr(m, "type", None) in ("human", "ai")
             and isinstance(m.content, str)
             and m.content.strip()
         ]
-        rewritten = main_model.invoke(prompt).content.strip()
-        if rewritten and rewritten != original:
-            logger.info(f"rewriter: '{original}' → '{rewritten}'")
-            updated = list(messages)
-            updated[last_human_idx] = HumanMessage(content=rewritten)
-            return {"messages": updated}
-        return {}
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # NODE 2 — intent_detector
-    #
-    # Determines wants_chart from the user's latest message.
-    # Two triggers:
-    #   A) EXPLICIT  — user says "chart", "graph", "plot", "visualise", etc.
-    #   B) IMPLIED   — user asks a comparative/trend/distribution question where
-    #                  a chart would naturally help, even without saying "chart"
-    #
-    # Uses gpt-4.1-mini with a strict yes/no prompt — fast and cheap.
-    # ══════════════════════════════════════════════════════════════════════════
-    INTENT_SYSTEM = """You are a chart-intent classifier for a BI assistant.
-
-Given the user's question, decide if they want a chart/graph/visualisation.
-
-Return ONLY one word: YES or NO
-
-Classify as YES if:
-- The user explicitly mentions: chart, graph, plot, visualise, visualize, bar, pie,
-  line chart, histogram, scatter, diagram, show me a graph, draw, display as chart
-- The user asks for a comparison, trend, distribution, ranking, or breakdown where
-  a chart would clearly be the most useful output
-
-Classify as NO if:
-- The user asks a simple factual question (how many, what is, who, when, list)
-- The user wants a text answer or table, not a visual
-- The question is conversational or asks for an explanation
-
-Respond with ONLY: YES or NO
-"""
-
-    def intent_detector(state: AgentState) -> dict:
-        messages = state["messages"]
-        # Get the current user question (last human message)
-        user_q = ""
-        for m in reversed(messages):
-            if getattr(m, "type", None) == "human":
-                user_q = m.content if isinstance(m.content, str) else ""
-                break
-
-        if not user_q:
-            return {"wants_chart": False}
+        history_text = "\n".join(history_lines) or "(no previous messages)"
 
         try:
-            resp = main_model.invoke(
+            result = analyzer.invoke(
                 [
-                    {"role": "system", "content": INTENT_SYSTEM},
-                    {"role": "user", "content": user_q},
+                    {"role": "system", "content": ANALYZE_SYSTEM},
+                    {
+                        "role": "user",
+                        "content": f"Conversation history:\n{history_text}\n\n"
+                        f"Latest question: {original}",
+                    },
                 ]
             )
-            answer = resp.content.strip().upper()
-            wants = answer.startswith("YES")
-            logger.info(f"intent_detector: wants_chart={wants} (raw='{answer[:20]}')")
-            return {"wants_chart": wants}
         except Exception as exc:
-            logger.warning(f"intent_detector failed, defaulting to False: {exc}")
+            logger.warning(f"analyze_question failed, using original question: {exc}")
             return {"wants_chart": False}
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # NODE 3 — list_tables
-    # ══════════════════════════════════════════════════════════════════════════
-    def list_tables(state: AgentState) -> dict:
-        tc = {
-            "name": "sql_db_list_tables",
-            "args": {},
-            "id": "list_tc",
-            "type": "tool_call",
-        }
-        tc_msg = AIMessage(content="", tool_calls=[tc])
-        t_msg = list_tables_tool.invoke(tc)
-        summary = AIMessage(f"Available tables: {t_msg.content}")
-        return {"messages": [tc_msg, t_msg, summary]}
+        rewritten = (result.rewritten_question or "").strip() or original
+        logger.info(
+            f"analyze_question: wants_chart={result.wants_chart} "
+            f"'{original}' → '{rewritten}'"
+        )
+        update: dict = {"wants_chart": result.wants_chart}
+        if rewritten != original:
+            # Same id → add_messages replaces the original question in place
+            update["messages"] = [HumanMessage(content=rewritten, id=last_human.id)]
+        return update
 
     # ══════════════════════════════════════════════════════════════════════════
-    # NODE 4 — call_get_schema
-    # ══════════════════════════════════════════════════════════════════════════
-    def call_get_schema(state: AgentState) -> dict:
-        llm = main_model.bind_tools([get_schema_tool], tool_choice="any")
-        return {"messages": [llm.invoke(state["messages"])]}
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # NODE 5 — generate_query
+    # NODE 2 — generate_query
     #
+    # The database schema is part of the system prompt, so no schema
+    # lookup step is needed. The static part of the prompt comes first so
+    # the provider's prompt cache can reuse it across requests.
     # The system prompt is dynamically adjusted based on wants_chart.
     # When chart is wanted: instructs the LLM to write a query suited for
     # visualisation (multi-column, grouped where useful) AND append CHART_REQUEST.
     # When no chart: standard answer prompt.
     # ══════════════════════════════════════════════════════════════════════════
     BASE_GENERATE_SYSTEM = f"""You are an expert SQL analyst and BI assistant for a {db.dialect} database.
+
+Database schema (tables, columns and sample rows):
+{schema_info}
 
 Your job:
 1. Write a correct, efficient SQL query that answers the user's question.
@@ -305,10 +243,19 @@ Rules:
 - NEVER show SQL query text in your answer — the system surfaces it separately.
 - NEVER include code blocks, markdown, or raw SQL in the answer text.
 - Write only what a business user wants to read.
-- Limit results to at most {settings.max_results} rows unless user specifies.
+- For top-N / ranking questions, return the N the user asked for (default {settings.max_results}).
+- For questions asking which items match a condition, return ALL matching rows
+  (the system caps results at {MAX_FETCH_ROWS} rows). If the tool result says rows
+  were cut off, tell the user how many matched in total.
 - Order by the most relevant column.
 - NEVER run DML statements (INSERT, UPDATE, DELETE, DROP, TRUNCATE).
+- Before running a query, check it for common mistakes: NOT IN with NULLs,
+  UNION vs UNION ALL, exclusive BETWEEN ranges, type mismatches, wrong quoting,
+  wrong argument counts, incorrect casts, and wrong join columns.
+- Run one query at a time. If a query returns an error, fix it and try again.
 - If the question cannot be answered from the available data, say so clearly.
+- If the question depends on earlier context that is missing (e.g. "those products"
+  with no previous conversation), do not run a query or guess — ask the user to clarify.
 """
 
     CHART_GENERATE_ADDITION = """
@@ -319,6 +266,10 @@ CHART MODE — the user wants a visualisation:
     → Do NOT just return COUNT(*). Instead return a meaningful breakdown, e.g.:
        artists grouped by number of albums, genres by track count, etc.
 - Prefer GROUP BY queries that produce multiple rows for interesting visual breakdowns.
+- For "which X has the highest/most/lowest ..." questions, return ALL groups ordered
+  by the value, so the chart shows the comparison; name the top one in your answer.
+- For distributions / proportions (pie charts), include every group — do not LIMIT,
+  otherwise the percentages are wrong.
 - After your text answer, append exactly this token on its own line: CHART_REQUEST
 """
 
@@ -328,71 +279,47 @@ CHART MODE — the user wants a visualisation:
             CHART_GENERATE_ADDITION if wants else ""
         )
         system = {"role": "system", "content": system_content}
-        llm = main_model.bind_tools([run_query_tool])
-        response = llm.invoke([system] + state["messages"])
+        llm = main_model.bind_tools([run_query_tool], parallel_tool_calls=False)
+        response = llm.invoke([system] + _current_turn(state["messages"]))
         return {"messages": [response]}
 
     # ══════════════════════════════════════════════════════════════════════════
-    # NODE 6 — check_query
-    # ══════════════════════════════════════════════════════════════════════════
-    CHECK_SYSTEM = f"""You are a {db.dialect} SQL expert. Double-check the query for:
-- NOT IN with NULLs, UNION vs UNION ALL, exclusive BETWEEN ranges
-- Type mismatches, wrong quoting, wrong argument counts, incorrect casts, wrong join columns
-
-Rewrite only if there are mistakes. Otherwise reproduce unchanged.
-Always call sql_db_query to execute it.
-"""
-
-    def check_query(state: AgentState) -> dict:
-        tool_call = state["messages"][-1].tool_calls[0]
-        llm = main_model.bind_tools([run_query_tool], tool_choice="any")
-        response = llm.invoke(
-            [
-                {"role": "system", "content": CHECK_SYSTEM},
-                {"role": "user", "content": tool_call["args"]["query"]},
-            ]
-        )
-        response.id = state["messages"][-1].id
-        return {"messages": [response]}
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # NODE 7 — run_query  (custom — captures rows + SQL into state)
+    # NODE 3 — run_query  (custom — captures rows + SQL into state)
+    # Errors are returned to generate_query as the tool result so it can fix
+    # the SQL and retry.
     # ══════════════════════════════════════════════════════════════════════════
     def run_query(state: AgentState) -> dict:
         last_msg = state["messages"][-1]
         tool_call = last_msg.tool_calls[0]
         sql = tool_call["args"].get("query", "")
 
-        result = run_query_tool.invoke(tool_call)
-        content = result.content if isinstance(result.content, str) else ""
+        result = execute_readonly(engine, sql, max_rows=MAX_FETCH_ROWS)
 
-        rows = _parse_sql_result(content)
-        n_cols = len(rows[0]) if rows and isinstance(rows[0], (tuple, list)) else 0
-        columns = _extract_columns(sql, n_cols)
-
-        logger.info(f"run_query: {len(rows)} rows | columns={columns} | sql={sql[:80]}")
+        logger.info(
+            f"run_query: {len(result.rows)} rows | columns={result.columns} "
+            f"| error={result.error is not None} | sql={sql[:80]}"
+        )
 
         tool_msg = ToolMessage(
-            content=content,
+            content=result.to_tool_content(),
             tool_call_id=tool_call["id"],
             name=run_query_tool.name,
         )
         return {
             "messages": [tool_msg],
             "last_sql": sql,
-            "sql_rows": rows,
-            "sql_columns": columns,
+            "sql_rows": result.rows,
+            "sql_columns": result.columns,
         }
 
     # ══════════════════════════════════════════════════════════════════════════
-    # NODE 8 — chart_config
+    # NODE 4 — chart_config
     #
     # Receives actual sql_rows + sql_columns from state.
-    # Asks gpt-4.1-mini to decide the best chart type and column mapping.
-    # Always produces a chart config — NEVER returns "none" here because
-    # wants_chart=True is the only reason this node runs.
-    # If data is truly unplottable, it will fabricate the best possible config
-    # (e.g. a single-value bar chart is still valid).
+    # Asks the fast model (structured output) for the best chart type and columns.
+    # Skips the LLM call when the query returned no rows. Otherwise always
+    # produces a chart config — wants_chart=True is the only reason this node
+    # runs, and even a single-value bar chart is valid.
     # ══════════════════════════════════════════════════════════════════════════
     CHART_CONFIG_SYSTEM = """You are a data visualisation expert for a BI system.
 
@@ -405,7 +332,8 @@ Chart types available: bar, line, pie, scatter, histogram
 Guidelines:
 - bar:       Best for comparisons between categories. Use when x is categorical, y is numeric.
 - line:      Best for trends over time. Use when x is ordered/temporal, y is numeric.
-- pie:       Best for proportions. Use only when there are ≤ 12 categories and they sum to a whole.
+- pie:       Best for proportions. Use only when there are ≤ 12 categories and the rows cover
+             the whole (no top-N cut-off).
 - scatter:   Best for correlation between two numeric variables.
 - histogram: Best for showing distribution of a single numeric column.
 
@@ -414,22 +342,28 @@ Special case — single row / scalar result:
 - Never refuse to produce a chart config.
 
 x_col and y_col MUST be exact column names from the provided columns list.
-
-Return ONLY valid JSON, no markdown fences, no explanation:
-{
-  "chart_type": "<bar|line|pie|scatter|histogram>",
-  "x_col":      "<exact column name>",
-  "y_col":      "<exact column name>",
-  "title":      "<concise descriptive title>",
-  "x_label":    "<x-axis label>",
-  "y_label":    "<y-axis label>"
-}
+y_col must be a numeric column whenever one exists. If no column is numeric, set y_col
+to the categorical column to count (the renderer will plot counts per value).
 """
+
+    class ChartConfig(BaseModel):
+        chart_type: Literal["bar", "line", "pie", "scatter", "histogram"]
+        x_col: str = Field(description="Exact column name for the x-axis / labels.")
+        y_col: str = Field(description="Exact column name for the numeric values.")
+        title: str = Field(description="Concise descriptive chart title.")
+        x_label: str = Field(description="X-axis label.")
+        y_label: str = Field(description="Y-axis label.")
+
+    chart_configurator = fast_model.with_structured_output(ChartConfig)
 
     def chart_config(state: AgentState) -> dict:
         rows = state.get("sql_rows", [])
         columns = state.get("sql_columns", [])
         sql = state.get("last_sql", "")
+
+        if not rows:
+            logger.info("chart_config: no rows to plot, skipping")
+            return {"chart_config": None}
 
         # Get user question and agent answer from messages
         user_q, agent_ans = "", ""
@@ -455,21 +389,15 @@ Rows ({len(rows)} total, showing up to 15): {sample}
 
 Agent answer: {agent_ans}
 
-Decide the best chart config and return JSON."""
+Decide the best chart config."""
 
         try:
-            raw = chart_model.invoke(
+            cfg = chart_configurator.invoke(
                 [
                     {"role": "system", "content": CHART_CONFIG_SYSTEM},
                     {"role": "user", "content": prompt},
                 ]
-            ).content.strip()
-
-            # Strip code fences if model adds them
-            raw = re.sub(
-                r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE
-            ).strip()
-            cfg = json.loads(raw)
+            ).model_dump()
             logger.info(f"chart_config: {cfg}")
             return {"chart_config": cfg}
 
@@ -495,12 +423,12 @@ Decide the best chart config and return JSON."""
 
     def after_generate(
         state: AgentState,
-    ) -> Literal["check_query", "chart_config", "__end__"]:
+    ) -> Literal["run_query", "chart_config", "__end__"]:
         last = state["messages"][-1]
         # Still has a tool call → keep running SQL
         if getattr(last, "tool_calls", None):
-            return "check_query"
-        # Final answer — route based on wants_chart flag (set by intent_detector)
+            return "run_query"
+        # Final answer — route based on wants_chart flag (set by analyze_question)
         if state.get("wants_chart", False):
             return "chart_config"
         return END
@@ -510,30 +438,20 @@ Decide the best chart config and return JSON."""
     # ══════════════════════════════════════════════════════════════════════════
     builder = StateGraph(AgentState)
 
-    builder.add_node("query_rewriter", query_rewriter)
-    builder.add_node("intent_detector", intent_detector)  # NEW
-    builder.add_node("list_tables", list_tables)
-    builder.add_node("call_get_schema", call_get_schema)
-    builder.add_node("get_schema", get_schema_node)
+    builder.add_node("analyze_question", analyze_question)
     builder.add_node("generate_query", generate_query)
-    builder.add_node("check_query", check_query)
     builder.add_node("run_query", run_query)
     builder.add_node("chart_config", chart_config)
 
-    builder.add_edge(START, "query_rewriter")
-    builder.add_edge("query_rewriter", "intent_detector")
-    builder.add_edge("intent_detector", "list_tables")
-    builder.add_edge("list_tables", "call_get_schema")
-    builder.add_edge("call_get_schema", "get_schema")
-    builder.add_edge("get_schema", "generate_query")
+    builder.add_edge(START, "analyze_question")
+    builder.add_edge("analyze_question", "generate_query")
     builder.add_conditional_edges("generate_query", after_generate)
-    builder.add_edge("check_query", "run_query")
     builder.add_edge("run_query", "generate_query")
     builder.add_edge("chart_config", END)
 
     agent = builder.compile()
     logger.info(
-        "Agent compiled: rewriter→intent→tables→schema→generate⇄[check→run]→[chart]→END"
+        "Agent compiled: analyze→generate⇄[run]→[chart]→END"
     )
     return agent, db
 
@@ -543,11 +461,15 @@ Decide the best chart config and return JSON."""
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-async def run_agent(agent: Any, question: str, session_id: str) -> dict:
+def run_agent(agent: Any, question: str, session_id: str) -> dict:
     """
     Run one agent turn. Returns answer, sql, chart_config, and metadata.
     """
-    history = get_history_as_langchain_messages(session_id, limit=20)
+    history = get_history_as_langchain_messages(
+        session_id,
+        limit=settings.history_messages,
+        max_chars=settings.history_max_chars,
+    )
     logger.info(f"[{session_id}] {len(history)} history msgs loaded.")
 
     initial: AgentState = {
@@ -559,7 +481,18 @@ async def run_agent(agent: Any, question: str, session_id: str) -> dict:
         "chart_config": None,
     }
 
-    final: AgentState = await agent.ainvoke(initial)
+    try:
+        final: AgentState = agent.invoke(
+            initial, config={"recursion_limit": RECURSION_LIMIT}
+        )
+    except GraphRecursionError:
+        logger.warning(f"[{session_id}] gave up after {RECURSION_LIMIT} graph steps")
+        final = {
+            **initial,
+            "messages": initial["messages"]
+            + [AIMessage(content=GIVE_UP_ANSWER)],
+            "wants_chart": False,
+        }
 
     messages = final.get("messages", [])
     sql_rows = final.get("sql_rows", [])
@@ -585,11 +518,11 @@ async def run_agent(agent: Any, question: str, session_id: str) -> dict:
             rewritten_q = msg.content if isinstance(msg.content, str) else question
             break
 
-    # Persist to memory DB
-    if question.strip():
-        store_message(session_id, role="user", content=question)
-    if final_answer.strip():
-        store_message(session_id, role="assistant", content=final_answer)
+    # Persist both turns to memory DB in one transaction
+    store_messages(
+        session_id,
+        [("user", question), ("assistant", final_answer)],
+    )
 
     logger.info(
         f"[{session_id}] done | wants_chart={wants_chart} "

@@ -5,6 +5,9 @@ Fully non-blocking — if MLflow server is unreachable (e.g. running locally
 without Docker), all tracking calls are silently skipped and the app
 continues normally. No retries, no startup delays.
 
+Each query is logged through MlflowClient with an explicit run_id, so
+concurrent requests never share or close each other's runs.
+
 To use MLflow locally:
     pip install mlflow
     mlflow ui --port 5000
@@ -12,6 +15,7 @@ Then set MLFLOW_TRACKING_URI=http://localhost:5000 in your .env
 """
 
 import logging
+import os
 import time
 import threading
 from typing import Optional
@@ -23,20 +27,8 @@ settings = get_settings()
 
 # ── Module-level state ────────────────────────────────────────────────────────
 _mlflow_enabled: bool = False  # set to True only if init succeeds
-_mlflow = None  # the mlflow module, imported lazily
-
-
-def _try_import_mlflow() -> bool:
-    """Attempt to import mlflow. Returns True on success."""
-    global _mlflow
-    try:
-        import mlflow as _mlflow_module
-
-        _mlflow = _mlflow_module
-        return True
-    except ImportError:
-        logger.warning("mlflow package not installed — tracking disabled.")
-        return False
+_client = None  # MlflowClient, created once the server is reachable
+_experiment_id: Optional[str] = None
 
 
 def init_mlflow() -> None:
@@ -45,21 +37,29 @@ def init_mlflow() -> None:
 
     If the server is unreachable the thread will fail silently after one
     connection attempt (no long retry loop in the foreground).
+    LangChain autologging is enabled only once the server is confirmed reachable.
     """
-    if not _try_import_mlflow():
+    try:
+        import mlflow  # noqa: F401
+    except ImportError:
+        logger.warning("mlflow package not installed — tracking disabled.")
         return
 
     def _init():
-        global _mlflow_enabled
+        global _mlflow_enabled, _client, _experiment_id
+        # Fail fast instead of MLflow's default multi-minute retry/backoff
+        os.environ.setdefault("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "0")
+        os.environ.setdefault("MLFLOW_HTTP_REQUEST_TIMEOUT", "5")
         try:
-            # Use a short socket timeout so we fail fast if server is down
             import mlflow
+            from mlflow.tracking import MlflowClient
 
             mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
+            experiment = mlflow.set_experiment(settings.mlflow_experiment_name)
+            mlflow.langchain.autolog()
 
-            # set_experiment makes the first network call — wrap tightly
-            mlflow.set_experiment(settings.mlflow_experiment_name)
-
+            _client = MlflowClient()
+            _experiment_id = experiment.experiment_id
             _mlflow_enabled = True
             logger.info(
                 f"MLflow connected: {settings.mlflow_tracking_uri} | "
@@ -95,15 +95,17 @@ class QueryTracker:
     def __init__(self, session_id: str, question: str):
         self.session_id = session_id
         self.question = question
-        self._run = None
+        self._run_id: Optional[str] = None
         self._start: float = 0.0
+        self._chart_generated = False
 
     def __enter__(self) -> "QueryTracker":
         self._start = time.perf_counter()
-        if not _mlflow_enabled or _mlflow is None:
+        if not _mlflow_enabled or _client is None:
             return self
         try:
-            self._run = _mlflow.start_run(
+            run = _client.create_run(
+                experiment_id=_experiment_id,
                 run_name=f"query_{self.session_id[:8]}",
                 tags={
                     "session_id": self.session_id,
@@ -111,57 +113,68 @@ class QueryTracker:
                     "component": "sql-agent",
                 },
             )
-            _mlflow.log_param("question", self.question[:500])
-            _mlflow.log_param("session_id", self.session_id)
-            _mlflow.log_param("model", settings.model_name)
+            self._run_id = run.info.run_id
+            _client.log_param(self._run_id, "question", self.question[:500])
+            _client.log_param(self._run_id, "session_id", self.session_id)
+            _client.log_param(self._run_id, "model", settings.model_name)
         except Exception as exc:
-            logger.debug(f"MLflow start_run skipped: {exc}")
-            self._run = None
+            logger.debug(f"MLflow create_run skipped: {exc}")
+            self._run_id = None
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         elapsed = round(time.perf_counter() - self._start, 3)
-        if not self._run:
+        if not self._run_id:
             return
         try:
-            _mlflow.log_metric("latency_seconds", elapsed)
+            _client.log_metric(self._run_id, "latency_seconds", elapsed)
+            _client.log_metric(
+                self._run_id, "chart_generated", 1 if self._chart_generated else 0
+            )
             if exc_type:
-                _mlflow.set_tag("status", "error")
-                _mlflow.log_param("error", str(exc_val)[:500])
-                _mlflow.end_run(status="FAILED")
+                _client.set_tag(self._run_id, "status", "error")
+                _client.log_param(self._run_id, "error", str(exc_val)[:500])
+                _client.set_terminated(self._run_id, status="FAILED")
             else:
-                _mlflow.set_tag("status", "success")
-                _mlflow.end_run(status="FINISHED")
+                _client.set_tag(self._run_id, "status", "success")
+                _client.set_terminated(self._run_id, status="FINISHED")
         except Exception as exc:
-            logger.debug(f"MLflow end_run skipped: {exc}")
+            logger.debug(f"MLflow set_terminated skipped: {exc}")
 
     def log_result(self, result: dict) -> None:
         """Log answer metrics — no-op if MLflow is disabled."""
-        if not self._run:
+        if not self._run_id:
             return
         try:
             answer = result.get("answer", "")
-            chart_request = result.get("chart_request")
             messages = result.get("raw_messages", [])
 
-            _mlflow.log_metric("answer_length_chars", len(answer))
-            _mlflow.log_metric("message_count", len(messages))
-            _mlflow.log_metric("chart_generated", 1 if chart_request else 0)
+            _client.log_metric(self._run_id, "answer_length_chars", len(answer))
+            _client.log_metric(self._run_id, "message_count", len(messages))
+            _client.log_metric(self._run_id, "sql_rows", len(result.get("sql_rows", [])))
+            _client.log_metric(
+                self._run_id, "wants_chart", 1 if result.get("wants_chart") else 0
+            )
             if answer:
-                _mlflow.log_param("answer_preview", answer[:300])
-            if chart_request:
-                _mlflow.log_param("chart_request", chart_request[:300])
+                _client.log_param(self._run_id, "answer_preview", answer[:300])
+            if result.get("sql"):
+                _client.log_param(self._run_id, "sql", result["sql"][:500])
         except Exception as exc:
             logger.debug(f"MLflow log_result skipped: {exc}")
 
     def log_chart(self, chart_result: dict) -> None:
         """Log chart metrics — no-op if MLflow is disabled."""
-        if not self._run:
+        self._chart_generated = True
+        if not self._run_id:
             return
         try:
-            _mlflow.log_metric("chart_rows", chart_result.get("rows", 0))
-            _mlflow.log_param("chart_type", chart_result.get("chart_type", "unknown"))
-            _mlflow.set_tag("chart_title", chart_result.get("title", "")[:200])
+            _client.log_metric(self._run_id, "chart_rows", chart_result.get("rows", 0))
+            _client.log_param(
+                self._run_id, "chart_type", chart_result.get("chart_type", "unknown")
+            )
+            _client.set_tag(
+                self._run_id, "chart_title", chart_result.get("title", "")[:200]
+            )
         except Exception as exc:
             logger.debug(f"MLflow log_chart skipped: {exc}")
 

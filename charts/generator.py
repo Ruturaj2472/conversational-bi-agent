@@ -9,6 +9,9 @@ Handles all data shapes:
   - Multi-row   (e.g. genre/count) → bar, line, pie, scatter, histogram
   - Any column count ≥ 1
 
+Uses matplotlib's object-oriented Figure API (no pyplot global state), so
+charts can be rendered safely from multiple request threads at once.
+
 Public API:
     render_chart(rows, columns, config) -> dict
 """
@@ -17,12 +20,9 @@ import io
 import base64
 import logging
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import pandas as pd
+from matplotlib.figure import Figure
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +38,7 @@ STYLE = {
     "grid.color": "#313145",
     "grid.linewidth": 0.8,
 }
+GRID = {"color": STYLE["grid.color"], "linewidth": STYLE["grid.linewidth"]}
 PALETTE = [
     "#89b4fa",
     "#cba6f7",
@@ -118,49 +119,67 @@ def render_chart(rows: list, columns: list[str], config: dict) -> dict:
         y_col_resolved = df.columns[1] if len(df.columns) > 1 else df.columns[0]
         logger.warning(f"y_col '{y_col}' not found, using '{y_col_resolved}'")
 
-    x_data = df[x_col_resolved].astype(str)
-    y_data = pd.to_numeric(df[y_col_resolved], errors="coerce").fillna(0)
+    y_numeric = pd.to_numeric(df[y_col_resolved], errors="coerce")
+    if y_numeric.notna().any():
+        x_data = _format_labels(df[x_col_resolved])
+        y_data = y_numeric.fillna(0)
+    else:
+        # No numeric values: plot how many rows share each value of y_col
+        counts = df[y_col_resolved].astype(str).value_counts()
+        logger.info(f"y_col '{y_col_resolved}' is not numeric, plotting counts")
+        x_data = pd.Series(counts.index)
+        y_data = pd.Series(counts.values)
+        x_label = y_label or y_col_resolved
+        x_col_resolved, y_col_resolved, y_label = y_col_resolved, "count", "Count"
+        if chart_type in ("scatter", "histogram", "line"):
+            chart_type = "bar"
+        df = pd.DataFrame({x_col_resolved: x_data, y_col_resolved: y_data})
 
     # ── Render ────────────────────────────────────────────────────────────────
     try:
-        with plt.rc_context(STYLE):
-            fig, ax = plt.subplots(figsize=(12, 6))
-            fig.patch.set_facecolor("#1e1e2e")
+        fig = Figure(figsize=(12, 6))
+        ax = fig.subplots()
+        _apply_theme(fig, ax)
 
-            if chart_type == "pie":
-                _pie(ax, x_data, y_data)
-            elif chart_type == "line":
-                _line(ax, x_data, y_data)
-            elif chart_type == "scatter":
-                x_num = pd.to_numeric(df[x_col_resolved], errors="coerce").fillna(0)
-                _scatter(ax, x_num, y_data, x_data)
-            elif chart_type == "histogram":
-                _histogram(ax, y_data)
-            else:
-                _bar(ax, x_data, y_data)  # default: bar
+        if chart_type == "pie":
+            _pie(ax, x_data, y_data)
+        elif chart_type == "line":
+            _line(ax, x_data, y_data)
+        elif chart_type == "scatter":
+            x_num = pd.to_numeric(df[x_col_resolved], errors="coerce").fillna(0)
+            _scatter(ax, x_num, y_data, x_data)
+        elif chart_type == "histogram":
+            _histogram(ax, y_data)
+        else:
+            _bar(ax, x_data, y_data)  # default: bar
 
-            # Labels
-            ax.set_title(title, fontsize=13, fontweight="bold", pad=15, color="#cdd6f4")
-            if chart_type not in ("pie",):
-                ax.set_xlabel(
-                    (x_label or x_col_resolved).replace("_", " ").title(), fontsize=10
-                )
-                ax.set_ylabel(
-                    (y_label or y_col_resolved).replace("_", " ").title(), fontsize=10
-                )
-
-            plt.tight_layout()
-
-            buf = io.BytesIO()
-            fig.savefig(
-                buf,
-                format="png",
-                dpi=130,
-                bbox_inches="tight",
-                facecolor=fig.get_facecolor(),
+        # Labels
+        ax.set_title(
+            title, fontsize=13, fontweight="bold", pad=15, color=STYLE["text.color"]
+        )
+        if chart_type not in ("pie",):
+            ax.set_xlabel(
+                (x_label or x_col_resolved).replace("_", " ").title(),
+                fontsize=10,
+                color=STYLE["axes.labelcolor"],
             )
-            plt.close(fig)
-            buf.seek(0)
+            ax.set_ylabel(
+                (y_label or y_col_resolved).replace("_", " ").title(),
+                fontsize=10,
+                color=STYLE["axes.labelcolor"],
+            )
+
+        fig.tight_layout()
+
+        buf = io.BytesIO()
+        fig.savefig(
+            buf,
+            format="png",
+            dpi=130,
+            bbox_inches="tight",
+            facecolor=fig.get_facecolor(),
+        )
+        buf.seek(0)
 
         return {
             "image_base64": base64.b64encode(buf.read()).decode("utf-8"),
@@ -172,12 +191,36 @@ def render_chart(rows: list, columns: list[str], config: dict) -> dict:
         }
 
     except Exception as exc:
-        plt.close("all")
         logger.error(f"render_chart error: {exc}", exc_info=True)
         return {"image_base64": None, "error": str(exc)}
 
 
 # ── Chart type renderers ──────────────────────────────────────────────────────
+
+
+def _format_labels(series: pd.Series) -> pd.Series:
+    """Readable axis labels; ISO date/time strings become e.g. 'Jan 1997'."""
+    labels = series.astype(str)
+    if not labels.str.match(r"^\d{4}-\d{2}-\d{2}").all():
+        return labels
+    parsed = pd.to_datetime(labels, errors="coerce", utc=True)
+    if parsed.isna().any():
+        return labels
+    midnight = (parsed.dt.hour == 0) & (parsed.dt.minute == 0)
+    if midnight.all() and (parsed.dt.day == 1).all():
+        return parsed.dt.strftime("%b %Y")
+    if midnight.all():
+        return parsed.dt.strftime("%Y-%m-%d")
+    return parsed.dt.strftime("%Y-%m-%d %H:%M")
+
+
+def _apply_theme(fig, ax):
+    fig.set_facecolor(STYLE["figure.facecolor"])
+    ax.set_facecolor(STYLE["axes.facecolor"])
+    for spine in ax.spines.values():
+        spine.set_color(STYLE["axes.edgecolor"])
+    ax.tick_params(axis="x", colors=STYLE["xtick.color"])
+    ax.tick_params(axis="y", colors=STYLE["ytick.color"])
 
 
 def _bar(ax, x_data, y_data):
@@ -193,7 +236,7 @@ def _bar(ax, x_data, y_data):
     ax.set_xticks(range(len(x_data)))
     ax.set_xticklabels(x_data, rotation=45, ha="right", fontsize=9)
     ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:,.1f}"))
-    ax.grid(axis="y", alpha=0.3, zorder=0)
+    ax.grid(axis="y", alpha=0.3, zorder=0, **GRID)
     for bar in bars:
         h = bar.get_height()
         if h != 0:
@@ -223,7 +266,7 @@ def _line(ax, x_data, y_data):
     ax.set_xticks(xs)
     ax.set_xticklabels(x_data, rotation=45, ha="right", fontsize=9)
     ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:,.1f}"))
-    ax.grid(axis="y", alpha=0.3)
+    ax.grid(axis="y", alpha=0.3, **GRID)
 
 
 def _pie(ax, x_data, y_data):
@@ -236,6 +279,8 @@ def _pie(ax, x_data, y_data):
         pctdistance=0.85,
         wedgeprops={"width": 0.6},
     )
+    for t in texts:
+        t.set_color(STYLE["text.color"])
     for t in autotexts:
         t.set_color("#1e1e2e")
         t.set_fontsize(9)
@@ -253,11 +298,11 @@ def _scatter(ax, x_num, y_data, labels):
             color="#cdd6f4",
             alpha=0.85,
         )
-    ax.grid(alpha=0.3)
+    ax.grid(alpha=0.3, **GRID)
 
 
 def _histogram(ax, y_data):
     bins = min(20, max(5, len(y_data) // 2))
     ax.hist(y_data, bins=bins, color=PALETTE[0], edgecolor="#1e1e2e")
     ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:,.0f}"))
-    ax.grid(axis="y", alpha=0.3)
+    ax.grid(axis="y", alpha=0.3, **GRID)
