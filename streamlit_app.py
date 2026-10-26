@@ -6,6 +6,7 @@ Run:
 """
 
 import base64
+import os
 import uuid
 from io import BytesIO
 
@@ -13,7 +14,7 @@ import requests
 import streamlit as st
 from PIL import Image
 
-API_BASE = "http://localhost:8000"
+API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000").rstrip("/")
 CHART_ENDPOINT = f"{API_BASE}/chart"
 HISTORY_ENDPOINT = f"{API_BASE}/history"
 HEALTH_ENDPOINT = f"{API_BASE}/health"

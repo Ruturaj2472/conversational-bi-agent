@@ -1,10 +1,7 @@
 FROM python:3.13-slim
 
-# System dependencies
-RUN apt-get update && apt-get install -y \
-    gcc \
-    libpq-dev \
-    curl \
+# curl is used by the HEALTHCHECK
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv
@@ -18,14 +15,11 @@ COPY requirements.txt .
 # Install dependencies using uv (FAST ⚡)
 RUN uv pip install --system --no-cache -r requirements.txt
 
-# Copy application code
+# Copy application code (secrets come from env_file at runtime, never the image)
 COPY app/            ./app/
 COPY charts/         ./charts/
 COPY mlflow_track/   ./mlflow_track/
 COPY scripts/        ./scripts/
-COPY .env .env
-# Make scripts importable
-RUN touch app/__init__.py charts/__init__.py mlflow_track/__init__.py scripts/__init__.py
 
 # Non-root user for security
 RUN adduser --disabled-password --gecos "" appuser && chown -R appuser /app

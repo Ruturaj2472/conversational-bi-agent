@@ -1,4 +1,3 @@
-black
 fastapi
 langchain
 langchain-community
@@ -8,12 +7,10 @@ matplotlib
 mlflow
 openai
 pandas
-pillow
 psycopg2-binary
 pydantic
 pydantic-settings
 python-dotenv
 requests
 sqlalchemy
-streamlit
 uvicorn[standard]

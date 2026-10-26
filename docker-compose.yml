@@ -29,3 +29,18 @@ services:
     restart: unless-stopped
     extra_hosts:
       - "host.docker.internal:host-gateway"   # Linux only — no-op on Mac/Windows
+
+  # ── Streamlit UI ──────────────────────────────────────────────────────────
+  bi-ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.streamlit
+    container_name: bi-ui
+    ports:
+      - "8501:8501"
+    environment:
+      API_BASE_URL: http://bi-agent:8000
+    depends_on:
+      bi-agent:
+        condition: service_healthy
+    restart: unless-stopped
