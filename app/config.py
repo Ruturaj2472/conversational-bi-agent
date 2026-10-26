@@ -25,12 +25,12 @@ class Settings(BaseSettings):
     # OpenAI
     openai_api_key: str
 
-    # Business DB (Chinook / your data)
+    # Business DB (Northwind / your data)
     postgres_host: str = "localhost"
     postgres_port: int = 5432
     postgres_user: str = "postgres"
     postgres_password: str = "postgres"
-    postgres_db: str = "chinook"
+    postgres_db: str = "northwind"
 
     # Agent Memory DB (unset fields fall back to the business DB values)
     memory_postgres_host: Optional[str] = None
@@ -68,7 +68,7 @@ class Settings(BaseSettings):
 
     @property
     def business_db_url(self) -> str:
-        """SQLAlchemy URL for the business / Chinook database."""
+        """SQLAlchemy URL for the business / Northwind database."""
         return URL.create(
             "postgresql+psycopg2",
             username=self.postgres_user,

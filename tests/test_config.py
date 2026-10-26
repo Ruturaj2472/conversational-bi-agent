@@ -30,7 +30,7 @@ def test_defaults_load_without_port_env():
     s = make_settings()
     assert s.postgres_port == 5432
     assert s.business_db_url == (
-        "postgresql+psycopg2://postgres:postgres@localhost:5432/chinook"
+        "postgresql+psycopg2://postgres:postgres@localhost:5432/northwind"
     )
 
 
