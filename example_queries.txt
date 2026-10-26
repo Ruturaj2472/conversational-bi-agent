@@ -1,0 +1,18 @@
+Who supplies those products?
+Which country are those suppliers from? give me a chart suitable for this
+List all product categories with their category names
+
+Which category had the highest revenue?
+How many products are in that category?
+
+Which country has the most suppliers? Show as a pie chart
+Who are the top 5 employees by number of orders handled?
+
+Which products are below their reorder level? List them with current stock and reorder point
+
+Show me monthly order volume trend for 1997 as a line chart
+
+
+Which supplier provides the most expensive products on average?
+
+What are the top 3 most ordered products?
