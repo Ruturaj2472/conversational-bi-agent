@@ -39,7 +39,6 @@ State:
     chart_config  - LLM-decided chart config dict, or None
 """
 
-import ast
 import json
 import logging
 import re
@@ -53,13 +52,17 @@ from langchain_core.messages import ToolMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
+from sqlalchemy import create_engine
 from typing_extensions import TypedDict
 
 from app.config import get_settings
 from app.memory import get_history_as_langchain_messages, store_message
+from app.sql_runner import execute_readonly
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
+
+MAX_FETCH_ROWS = 100  # hard cap on rows fetched per query
 
 # ══════════════════════════════════════════════════════════════════════════════
 # State
@@ -73,47 +76,6 @@ class AgentState(TypedDict):
     sql_rows: list  # raw result rows
     sql_columns: list[str]  # column names
     chart_config: Optional[dict]  # decided by chart_config node
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Helpers
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-def _parse_sql_result(content: str) -> list:
-    """Parse sql_db_query output string into a list of row tuples."""
-    content = content.strip()
-    if not content or content.lower().startswith("error"):
-        return []
-    try:
-        rows = ast.literal_eval(content)
-        return rows if isinstance(rows, list) else []
-    except Exception:
-        return []
-
-
-def _extract_columns(sql: str, n_cols: int) -> list[str]:
-    """Extract column alias names from SELECT clause. Falls back to col_0, col_1…"""
-    if n_cols == 0:
-        return []
-    try:
-        m = re.search(r"SELECT\s+(.+?)\s+FROM", sql, re.IGNORECASE | re.DOTALL)
-        if not m:
-            return [f"col_{i}" for i in range(n_cols)]
-        parts = m.group(1).split(",")
-        names = []
-        for p in parts:
-            alias = re.search(r"\bAS\s+[\"'`]?(\w+)[\"'`]?", p, re.IGNORECASE)
-            if alias:
-                names.append(alias.group(1).lower())
-            else:
-                token = p.strip().split()[-1].strip("\"'`").lower()
-                names.append(token or f"col_{len(names)}")
-        while len(names) < n_cols:
-            names.append(f"col_{len(names)}")
-        return names[:n_cols]
-    except Exception:
-        return [f"col_{i}" for i in range(n_cols)]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -132,7 +94,14 @@ def build_agent() -> tuple[Any, SQLDatabase]:
     )
 
     # ── DB ────────────────────────────────────────────────────────────────────
-    db = SQLDatabase.from_uri(settings.business_db_url, sample_rows_in_table_info=3)
+    engine = create_engine(
+        settings.business_db_url,
+        pool_pre_ping=True,
+        connect_args={
+            "options": f"-c statement_timeout={settings.query_timeout_seconds * 1000}"
+        },
+    )
+    db = SQLDatabase(engine, sample_rows_in_table_info=3)
     logger.info(f"DB: dialect={db.dialect} tables={db.get_usable_table_names()}")
 
     # ── Tools ─────────────────────────────────────────────────────────────────
@@ -356,25 +325,23 @@ Always call sql_db_query to execute it.
         tool_call = last_msg.tool_calls[0]
         sql = tool_call["args"].get("query", "")
 
-        result = run_query_tool.invoke(tool_call)
-        content = result.content if isinstance(result.content, str) else ""
+        result = execute_readonly(engine, sql, max_rows=MAX_FETCH_ROWS)
 
-        rows = _parse_sql_result(content)
-        n_cols = len(rows[0]) if rows and isinstance(rows[0], (tuple, list)) else 0
-        columns = _extract_columns(sql, n_cols)
-
-        logger.info(f"run_query: {len(rows)} rows | columns={columns} | sql={sql[:80]}")
+        logger.info(
+            f"run_query: {len(result.rows)} rows | columns={result.columns} "
+            f"| error={result.error is not None} | sql={sql[:80]}"
+        )
 
         tool_msg = ToolMessage(
-            content=content,
+            content=result.to_tool_content(),
             tool_call_id=tool_call["id"],
             name=run_query_tool.name,
         )
         return {
             "messages": [tool_msg],
             "last_sql": sql,
-            "sql_rows": rows,
-            "sql_columns": columns,
+            "sql_rows": result.rows,
+            "sql_columns": result.columns,
         }
 
     # ══════════════════════════════════════════════════════════════════════════

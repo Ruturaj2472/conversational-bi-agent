@@ -51,6 +51,7 @@ class Settings(BaseSettings):
     # Agent
     max_results: int = 10
     model_name: str = "gpt-4.1-mini"
+    query_timeout_seconds: int = 30
 
     @model_validator(mode="after")
     def _default_memory_db_to_business_db(self) -> "Settings":
