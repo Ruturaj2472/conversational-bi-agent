@@ -118,14 +118,18 @@ async def list_tables():
     return {"tables": _db.get_usable_table_names()}
 
 
+# Agent, chart and memory endpoints are plain `def`: FastAPI runs them in its
+# thread pool, so blocking LLM / DB / matplotlib work never stalls the event loop.
+
+
 @app.post("/chat", response_model=ChatResponse, tags=["Agent"])
-async def chat(req: ChatRequest):
+def chat(req: ChatRequest):
     """Text answer + SQL. No chart."""
     if _agent is None:
         raise HTTPException(503, "Agent not ready.")
     with track_query(session_id=req.session_id, question=req.message) as tracker:
         try:
-            result = await run_agent(_agent, req.message, req.session_id)
+            result = run_agent(_agent, req.message, req.session_id)
             tracker.log_result(result)
         except Exception as exc:
             logger.error(f"Agent error: {exc}", exc_info=True)
@@ -140,7 +144,7 @@ async def chat(req: ChatRequest):
 
 
 @app.post("/chart", response_model=ChartResponse, tags=["Agent"])
-async def chat_with_chart(req: ChatRequest):
+def chat_with_chart(req: ChatRequest):
     """
     Text answer + SQL + chart image.
     - intent_detector decides if user wants a chart (explicit or implied).
@@ -153,7 +157,7 @@ async def chat_with_chart(req: ChatRequest):
 
     with track_query(session_id=req.session_id, question=req.message) as tracker:
         try:
-            result = await run_agent(_agent, req.message, req.session_id)
+            result = run_agent(_agent, req.message, req.session_id)
             tracker.log_result(result)
         except Exception as exc:
             logger.error(f"Agent error: {exc}", exc_info=True)
@@ -196,7 +200,7 @@ async def chat_with_chart(req: ChatRequest):
 
 
 @app.get("/history/{session_id}", response_model=HistoryResponse, tags=["Memory"])
-async def get_conversation_history(session_id: str, limit: int = 50):
+def get_conversation_history(session_id: str, limit: int = 50):
     rows = get_history(session_id, limit=limit)
     return HistoryResponse(
         session_id=session_id,
@@ -206,7 +210,7 @@ async def get_conversation_history(session_id: str, limit: int = 50):
 
 
 @app.delete("/history/{session_id}", tags=["Memory"])
-async def delete_conversation_history(session_id: str):
+def delete_conversation_history(session_id: str):
     deleted = clear_history(session_id)
     return {
         "message": f"Cleared {deleted} messages for session '{session_id}'.",

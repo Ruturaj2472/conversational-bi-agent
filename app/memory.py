@@ -15,6 +15,7 @@ Schema (auto-created on startup):
 Public API:
     init_db()                                      -- create engine + tables
     store_message(session_id, role, content)        -- INSERT one message
+    store_messages(session_id, [(role, content)])   -- INSERT several in one transaction
     get_history(session_id, limit)                  -- SELECT last N rows as dicts
     get_history_as_langchain_messages(session_id)   -- returns LangChain message objects
     get_recent_context_string(session_id, limit)    -- formatted string for prompts
@@ -32,6 +33,7 @@ from sqlalchemy import (
     String,
     Text,
     DateTime,
+    Index,
     create_engine,
 )
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
@@ -55,9 +57,13 @@ class ConversationMessage(Base):
     """One turn in a conversation — a single user or assistant message."""
 
     __tablename__ = "conversation_messages"
+    __table_args__ = (
+        # Serves "latest N messages for a session" without a separate sort
+        Index("ix_conversation_messages_session_id_id", "session_id", "id"),
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    session_id = Column(String(255), nullable=False, index=True)
+    session_id = Column(String(255), nullable=False)
     role = Column(String(50), nullable=False)  # 'user' | 'assistant'
     content = Column(Text, nullable=False)
     created_at = Column(
@@ -111,6 +117,9 @@ def init_db() -> None:
 
     # Create tables — safe to call repeatedly (IF NOT EXISTS)
     Base.metadata.create_all(_engine)
+    # create_all skips indexes on tables that already exist
+    for index in ConversationMessage.__table__.indexes:
+        index.create(_engine, checkfirst=True)
 
     _SessionLocal = sessionmaker(bind=_engine, autocommit=False, autoflush=False)
     logger.info("Memory DB ready — table 'conversation_messages' ensured.")
@@ -167,6 +176,40 @@ def store_message(session_id: str, role: str, content: str) -> ConversationMessa
         return row
 
 
+def store_messages(session_id: str, messages: list[tuple[str, str]]) -> int:
+    """
+    Persist several messages in a single transaction, in the given order.
+    Messages with empty content are skipped.
+
+    Args:
+        session_id: Conversation thread identifier.
+        messages:   List of (role, content) tuples.
+
+    Returns:
+        Number of rows inserted.
+
+    Raises:
+        ValueError: if any role is not 'user'/'assistant'.
+    """
+    rows = []
+    for role, content in messages:
+        if role not in ("user", "assistant"):
+            raise ValueError(f"role must be 'user' or 'assistant', got {role!r}")
+        if content and content.strip():
+            rows.append(
+                ConversationMessage(
+                    session_id=session_id, role=role, content=content.strip()
+                )
+            )
+    if not rows:
+        return 0
+    with _get_session() as db:
+        db.add_all(rows)
+        db.commit()
+    logger.debug(f"Stored {len(rows)} messages for session '{session_id}'")
+    return len(rows)
+
+
 # ── Read ──────────────────────────────────────────────────────────────────────
 
 
@@ -188,7 +231,7 @@ def get_history(
         rows = (
             db.query(ConversationMessage)
             .filter(ConversationMessage.session_id == session_id)
-            .order_by(ConversationMessage.created_at.desc())
+            .order_by(ConversationMessage.id.desc())
             .limit(limit)
             .all()
         )

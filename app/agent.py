@@ -45,7 +45,7 @@ from sqlalchemy import create_engine
 from typing_extensions import TypedDict
 
 from app.config import get_settings
-from app.memory import get_history_as_langchain_messages, store_message
+from app.memory import get_history_as_langchain_messages, store_messages
 from app.sql_runner import execute_readonly
 
 logger = logging.getLogger(__name__)
@@ -447,7 +447,7 @@ Decide the best chart config."""
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-async def run_agent(agent: Any, question: str, session_id: str) -> dict:
+def run_agent(agent: Any, question: str, session_id: str) -> dict:
     """
     Run one agent turn. Returns answer, sql, chart_config, and metadata.
     """
@@ -468,7 +468,7 @@ async def run_agent(agent: Any, question: str, session_id: str) -> dict:
     }
 
     try:
-        final: AgentState = await agent.ainvoke(
+        final: AgentState = agent.invoke(
             initial, config={"recursion_limit": RECURSION_LIMIT}
         )
     except GraphRecursionError:
@@ -504,11 +504,11 @@ async def run_agent(agent: Any, question: str, session_id: str) -> dict:
             rewritten_q = msg.content if isinstance(msg.content, str) else question
             break
 
-    # Persist to memory DB
-    if question.strip():
-        store_message(session_id, role="user", content=question)
-    if final_answer.strip():
-        store_message(session_id, role="assistant", content=final_answer)
+    # Persist both turns to memory DB in one transaction
+    store_messages(
+        session_id,
+        [("user", question), ("assistant", final_answer)],
+    )
 
     logger.info(
         f"[{session_id}] done | wants_chart={wants_chart} "
