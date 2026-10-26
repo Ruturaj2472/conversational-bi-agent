@@ -8,19 +8,11 @@ Graph flow:
   [query_rewriter]     ← resolves follow-up references using history
       │
       ▼
-  [intent_detector]    ← NEW: classifies if user wants a chart (explicit or implied)
+  [intent_detector]    ← classifies if user wants a chart (explicit or implied)
       │                        sets state["wants_chart"] = True/False
       ▼
-  [list_tables]
-      │
-      ▼
-  [call_get_schema]
-      │
-      ▼
-  [get_schema]
-      │
-      ▼
-  [generate_query]     ← writes SQL query, stores it in state["last_sql"]
+  [generate_query]     ← schema is in the system prompt (loaded once at startup);
+      │                  writes SQL query, stores it in state["last_sql"]
       │
       ├─(tool call)──► [check_query] ──► [run_query] ──► back to [generate_query]
       │
@@ -45,13 +37,12 @@ import re
 from typing import Annotated, Any, Literal, Optional
 
 from langchain.chat_models import init_chat_model
-from langchain.messages import AIMessage, HumanMessage
+from langchain.messages import HumanMessage
 from langchain_community.utilities import SQLDatabase
 from langchain_community.agent_toolkits import SQLDatabaseToolkit
 from langchain_core.messages import ToolMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode
 from sqlalchemy import create_engine
 from typing_extensions import TypedDict
 
@@ -102,15 +93,17 @@ def build_agent() -> tuple[Any, SQLDatabase]:
         },
     )
     db = SQLDatabase(engine, sample_rows_in_table_info=3)
-    logger.info(f"DB: dialect={db.dialect} tables={db.get_usable_table_names()}")
+    tables = db.get_usable_table_names()
+    logger.info(f"DB: dialect={db.dialect} tables={tables}")
+
+    # Schema (CREATE TABLE statements + sample rows) is loaded once at startup
+    # and embedded in the system prompt. Restart the app after schema changes.
+    schema_info = db.get_table_info()
+    logger.info(f"Schema loaded: {len(tables)} tables, {len(schema_info)} chars")
 
     # ── Tools ─────────────────────────────────────────────────────────────────
     toolkit = SQLDatabaseToolkit(db=db, llm=main_model)
-    tools = toolkit.get_tools()
-    get_schema_tool = next(t for t in tools if t.name == "sql_db_schema")
-    run_query_tool = next(t for t in tools if t.name == "sql_db_query")
-    list_tables_tool = next(t for t in tools if t.name == "sql_db_list_tables")
-    get_schema_node = ToolNode([get_schema_tool], name="get_schema")
+    run_query_tool = next(t for t in toolkit.get_tools() if t.name == "sql_db_query")
 
     # ══════════════════════════════════════════════════════════════════════════
     # NODE 1 — query_rewriter
@@ -227,36 +220,20 @@ Respond with ONLY: YES or NO
             return {"wants_chart": False}
 
     # ══════════════════════════════════════════════════════════════════════════
-    # NODE 3 — list_tables
-    # ══════════════════════════════════════════════════════════════════════════
-    def list_tables(state: AgentState) -> dict:
-        tc = {
-            "name": "sql_db_list_tables",
-            "args": {},
-            "id": "list_tc",
-            "type": "tool_call",
-        }
-        tc_msg = AIMessage(content="", tool_calls=[tc])
-        t_msg = list_tables_tool.invoke(tc)
-        summary = AIMessage(f"Available tables: {t_msg.content}")
-        return {"messages": [tc_msg, t_msg, summary]}
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # NODE 4 — call_get_schema
-    # ══════════════════════════════════════════════════════════════════════════
-    def call_get_schema(state: AgentState) -> dict:
-        llm = main_model.bind_tools([get_schema_tool], tool_choice="any")
-        return {"messages": [llm.invoke(state["messages"])]}
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # NODE 5 — generate_query
+    # NODE 3 — generate_query
     #
+    # The database schema is part of the system prompt, so no schema
+    # lookup step is needed. The static part of the prompt comes first so
+    # the provider's prompt cache can reuse it across requests.
     # The system prompt is dynamically adjusted based on wants_chart.
     # When chart is wanted: instructs the LLM to write a query suited for
     # visualisation (multi-column, grouped where useful) AND append CHART_REQUEST.
     # When no chart: standard answer prompt.
     # ══════════════════════════════════════════════════════════════════════════
     BASE_GENERATE_SYSTEM = f"""You are an expert SQL analyst and BI assistant for a {db.dialect} database.
+
+Database schema (tables, columns and sample rows):
+{schema_info}
 
 Your job:
 1. Write a correct, efficient SQL query that answers the user's question.
@@ -295,7 +272,7 @@ CHART MODE — the user wants a visualisation:
         return {"messages": [response]}
 
     # ══════════════════════════════════════════════════════════════════════════
-    # NODE 6 — check_query
+    # NODE 4 — check_query
     # ══════════════════════════════════════════════════════════════════════════
     CHECK_SYSTEM = f"""You are a {db.dialect} SQL expert. Double-check the query for:
 - NOT IN with NULLs, UNION vs UNION ALL, exclusive BETWEEN ranges
@@ -318,7 +295,7 @@ Always call sql_db_query to execute it.
         return {"messages": [response]}
 
     # ══════════════════════════════════════════════════════════════════════════
-    # NODE 7 — run_query  (custom — captures rows + SQL into state)
+    # NODE 5 — run_query  (custom — captures rows + SQL into state)
     # ══════════════════════════════════════════════════════════════════════════
     def run_query(state: AgentState) -> dict:
         last_msg = state["messages"][-1]
@@ -345,7 +322,7 @@ Always call sql_db_query to execute it.
         }
 
     # ══════════════════════════════════════════════════════════════════════════
-    # NODE 8 — chart_config
+    # NODE 6 — chart_config
     #
     # Receives actual sql_rows + sql_columns from state.
     # Asks gpt-4.1-mini to decide the best chart type and column mapping.
@@ -471,10 +448,7 @@ Decide the best chart config and return JSON."""
     builder = StateGraph(AgentState)
 
     builder.add_node("query_rewriter", query_rewriter)
-    builder.add_node("intent_detector", intent_detector)  # NEW
-    builder.add_node("list_tables", list_tables)
-    builder.add_node("call_get_schema", call_get_schema)
-    builder.add_node("get_schema", get_schema_node)
+    builder.add_node("intent_detector", intent_detector)
     builder.add_node("generate_query", generate_query)
     builder.add_node("check_query", check_query)
     builder.add_node("run_query", run_query)
@@ -482,10 +456,7 @@ Decide the best chart config and return JSON."""
 
     builder.add_edge(START, "query_rewriter")
     builder.add_edge("query_rewriter", "intent_detector")
-    builder.add_edge("intent_detector", "list_tables")
-    builder.add_edge("list_tables", "call_get_schema")
-    builder.add_edge("call_get_schema", "get_schema")
-    builder.add_edge("get_schema", "generate_query")
+    builder.add_edge("intent_detector", "generate_query")
     builder.add_conditional_edges("generate_query", after_generate)
     builder.add_edge("check_query", "run_query")
     builder.add_edge("run_query", "generate_query")
@@ -493,7 +464,7 @@ Decide the best chart config and return JSON."""
 
     agent = builder.compile()
     logger.info(
-        "Agent compiled: rewriter→intent→tables→schema→generate⇄[check→run]→[chart]→END"
+        "Agent compiled: rewriter→intent→generate⇄[check→run]→[chart]→END"
     )
     return agent, db
 
