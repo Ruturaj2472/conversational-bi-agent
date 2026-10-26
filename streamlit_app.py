@@ -33,11 +33,16 @@ st.set_page_config(
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "session_id" not in st.session_state:
+    st.session_state.session_id = ""
+if "loaded_session" not in st.session_state:
+    st.session_state.loaded_session = None
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
+@st.cache_data(ttl=15, show_spinner=False)
 def _check_health() -> dict | None:
     try:
         r = requests.get(HEALTH_ENDPOINT, timeout=5)
@@ -46,6 +51,7 @@ def _check_health() -> dict | None:
         return None
 
 
+@st.cache_data(ttl=300, show_spinner=False)
 def _fetch_tables() -> list[str]:
     try:
         r = requests.get(TABLES_ENDPOINT, timeout=5)
@@ -59,6 +65,24 @@ def _clear_history(session_id: str):
         requests.delete(f"{HISTORY_ENDPOINT}/{session_id}", timeout=10)
     except Exception:
         pass
+
+
+def _fetch_history(session_id: str) -> list[dict]:
+    try:
+        r = requests.get(f"{HISTORY_ENDPOINT}/{session_id}", timeout=10)
+        if r.status_code != 200:
+            return []
+        return [
+            {"role": h["role"], "content": h["content"]}
+            for h in r.json().get("history", [])
+        ]
+    except Exception:
+        return []
+
+
+def _new_session():
+    # Runs before the rerun, so it may set the text_input's value
+    st.session_state.session_id = f"session-{uuid.uuid4().hex[:6]}"
 
 
 def _b64_to_image(b64: str) -> Image.Image:
@@ -82,20 +106,18 @@ with st.sidebar:
 
     st.divider()
 
-    # Session ID — manual input like your reference code
-    session_id = st.sidebar.text_input(
+    # Session ID — typed manually or generated with "New ID"
+    session_id = st.text_input(
         "Session ID",
+        key="session_id",
         help="Each session keeps its own conversation memory.",
-    )
+    ).strip()
 
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("🔄 New ID", use_container_width=True):
-            st.session_state["_new_session"] = f"session-{uuid.uuid4().hex[:6]}"
-            st.session_state.messages = []
-            st.rerun()
+        st.button("🔄 New ID", use_container_width=True, on_click=_new_session)
     with col2:
-        if st.button("🗑️ Clear", use_container_width=True):
+        if st.button("🗑️ Clear", use_container_width=True, disabled=not session_id):
             _clear_history(session_id)
             st.session_state.messages = []
             st.rerun()
@@ -120,9 +142,14 @@ with st.sidebar:
 
 st.title("🧠 Conversational BI Agent")
 
-if not session_id or session_id.strip() == "":
+if not session_id:
     st.error("Enter a Session ID in the sidebar before sending messages.")
     st.stop()
+
+# Switching sessions shows that session's saved conversation
+if st.session_state.loaded_session != session_id:
+    st.session_state.messages = _fetch_history(session_id)
+    st.session_state.loaded_session = session_id
 
 # ── Replay chat history ───────────────────────────────────────────────────────
 
@@ -161,11 +188,6 @@ for msg in st.session_state.messages:
 
 
 # ── Chat input ────────────────────────────────────────────────────────────────
-
-# Pick up prefill from example buttons
-prefill = st.session_state.pop("_prefill", None)
-if prefill:
-    st.session_state["_chat_input_value"] = prefill
 
 if prompt := st.chat_input("Ask anything about your data…"):
 
