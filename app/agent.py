@@ -12,7 +12,7 @@ Graph flow:
   [generate_query]     ← schema is in the system prompt (loaded once at startup);
       │                  writes SQL query, stores it in state["last_sql"]
       │
-      ├─(tool call)──► [check_query] ──► [run_query] ──► back to [generate_query]
+      ├─(tool call)──► [run_query] ──► back to [generate_query]
       │
       └─(final answer)
             │
@@ -35,10 +35,11 @@ import re
 from typing import Annotated, Any, Literal, Optional
 
 from langchain.chat_models import init_chat_model
-from langchain.messages import HumanMessage
+from langchain.messages import AIMessage, HumanMessage
 from langchain_community.utilities import SQLDatabase
 from langchain_community.agent_toolkits import SQLDatabaseToolkit
 from langchain_core.messages import ToolMessage
+from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
@@ -53,6 +54,11 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 MAX_FETCH_ROWS = 100  # hard cap on rows fetched per query
+RECURSION_LIMIT = 12  # graph steps per turn; allows ~4 SQL attempts
+GIVE_UP_ANSWER = (
+    "I couldn't build a working query for that question. "
+    "Please try rephrasing it or making it more specific."
+)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # State
@@ -222,6 +228,10 @@ Rules:
 - Limit results to at most {settings.max_results} rows unless user specifies.
 - Order by the most relevant column.
 - NEVER run DML statements (INSERT, UPDATE, DELETE, DROP, TRUNCATE).
+- Before running a query, check it for common mistakes: NOT IN with NULLs,
+  UNION vs UNION ALL, exclusive BETWEEN ranges, type mismatches, wrong quoting,
+  wrong argument counts, incorrect casts, and wrong join columns.
+- Run one query at a time. If a query returns an error, fix it and try again.
 - If the question cannot be answered from the available data, say so clearly.
 """
 
@@ -242,35 +252,14 @@ CHART MODE — the user wants a visualisation:
             CHART_GENERATE_ADDITION if wants else ""
         )
         system = {"role": "system", "content": system_content}
-        llm = main_model.bind_tools([run_query_tool])
+        llm = main_model.bind_tools([run_query_tool], parallel_tool_calls=False)
         response = llm.invoke([system] + state["messages"])
         return {"messages": [response]}
 
     # ══════════════════════════════════════════════════════════════════════════
-    # NODE 3 — check_query
-    # ══════════════════════════════════════════════════════════════════════════
-    CHECK_SYSTEM = f"""You are a {db.dialect} SQL expert. Double-check the query for:
-- NOT IN with NULLs, UNION vs UNION ALL, exclusive BETWEEN ranges
-- Type mismatches, wrong quoting, wrong argument counts, incorrect casts, wrong join columns
-
-Rewrite only if there are mistakes. Otherwise reproduce unchanged.
-Always call sql_db_query to execute it.
-"""
-
-    def check_query(state: AgentState) -> dict:
-        tool_call = state["messages"][-1].tool_calls[0]
-        llm = main_model.bind_tools([run_query_tool], tool_choice="any")
-        response = llm.invoke(
-            [
-                {"role": "system", "content": CHECK_SYSTEM},
-                {"role": "user", "content": tool_call["args"]["query"]},
-            ]
-        )
-        response.id = state["messages"][-1].id
-        return {"messages": [response]}
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # NODE 4 — run_query  (custom — captures rows + SQL into state)
+    # NODE 3 — run_query  (custom — captures rows + SQL into state)
+    # Errors are returned to generate_query as the tool result so it can fix
+    # the SQL and retry.
     # ══════════════════════════════════════════════════════════════════════════
     def run_query(state: AgentState) -> dict:
         last_msg = state["messages"][-1]
@@ -297,7 +286,7 @@ Always call sql_db_query to execute it.
         }
 
     # ══════════════════════════════════════════════════════════════════════════
-    # NODE 5 — chart_config
+    # NODE 4 — chart_config
     #
     # Receives actual sql_rows + sql_columns from state.
     # Asks gpt-4.1-mini to decide the best chart type and column mapping.
@@ -407,11 +396,11 @@ Decide the best chart config and return JSON."""
 
     def after_generate(
         state: AgentState,
-    ) -> Literal["check_query", "chart_config", "__end__"]:
+    ) -> Literal["run_query", "chart_config", "__end__"]:
         last = state["messages"][-1]
         # Still has a tool call → keep running SQL
         if getattr(last, "tool_calls", None):
-            return "check_query"
+            return "run_query"
         # Final answer — route based on wants_chart flag (set by analyze_question)
         if state.get("wants_chart", False):
             return "chart_config"
@@ -424,20 +413,18 @@ Decide the best chart config and return JSON."""
 
     builder.add_node("analyze_question", analyze_question)
     builder.add_node("generate_query", generate_query)
-    builder.add_node("check_query", check_query)
     builder.add_node("run_query", run_query)
     builder.add_node("chart_config", chart_config)
 
     builder.add_edge(START, "analyze_question")
     builder.add_edge("analyze_question", "generate_query")
     builder.add_conditional_edges("generate_query", after_generate)
-    builder.add_edge("check_query", "run_query")
     builder.add_edge("run_query", "generate_query")
     builder.add_edge("chart_config", END)
 
     agent = builder.compile()
     logger.info(
-        "Agent compiled: analyze→generate⇄[check→run]→[chart]→END"
+        "Agent compiled: analyze→generate⇄[run]→[chart]→END"
     )
     return agent, db
 
@@ -463,7 +450,18 @@ async def run_agent(agent: Any, question: str, session_id: str) -> dict:
         "chart_config": None,
     }
 
-    final: AgentState = await agent.ainvoke(initial)
+    try:
+        final: AgentState = await agent.ainvoke(
+            initial, config={"recursion_limit": RECURSION_LIMIT}
+        )
+    except GraphRecursionError:
+        logger.warning(f"[{session_id}] gave up after {RECURSION_LIMIT} graph steps")
+        final = {
+            **initial,
+            "messages": initial["messages"]
+            + [AIMessage(content=GIVE_UP_ANSWER)],
+            "wants_chart": False,
+        }
 
     messages = final.get("messages", [])
     sql_rows = final.get("sql_rows", [])
