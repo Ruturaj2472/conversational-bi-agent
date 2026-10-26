@@ -1,0 +1,31 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Conversational BI Agent - Docker Compose
+#
+# NOTE: PostgreSQL runs OUTSIDE this compose stack on your local machine.
+#       The app connects to it via host.docker.internal.
+#       Before starting, ensure:
+#         1. psql: CREATE DATABASE chinook;
+#         2. psql: CREATE DATABASE agent_memory;
+#         3. python scripts/load_northwind.py
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Conversational BI Agent (FastAPI + LangGraph) ─────────────────────────
+  bi-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bi-agent
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # Reach your local Postgres and MLflow from inside Docker
+      POSTGRES_HOST: host.docker.internal
+      MEMORY_POSTGRES_HOST: host.docker.internal
+      MLFLOW_TRACKING_URI: http://host.docker.internal:5000
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # Linux only — no-op on Mac/Windows
