@@ -54,19 +54,12 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from typing_extensions import TypedDict
-import mlflow
-
-mlflow.langchain.autolog()
-
-# Optional: Set a tracking URI and an experiment
 
 from app.config import get_settings
 from app.memory import get_history_as_langchain_messages, store_message
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
-mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
-mlflow.set_experiment(settings.mlflow_experiment_name)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # State
