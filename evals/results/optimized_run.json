@@ -1,0 +1,220 @@
+{
+  "description": "Recorded run of example_queries.txt against the Docker stack (PostgreSQL 16 + Northwind).",
+  "recorded_at": "2026-10-26T17:27:32+00:00",
+  "models": {
+    "main": "gpt-4o",
+    "fast": "gpt-4.1-mini"
+  },
+  "source": "POST /chart; LLM calls, tokens and cost from MLflow traces",
+  "questions": [
+    {
+      "id": "q01",
+      "group": 1,
+      "question": "Who supplies those products?",
+      "rewritten_question": "Who supplies the products mentioned previously?",
+      "answer": "Could you please specify which products you are referring to?",
+      "sql": "",
+      "wants_chart": false,
+      "chart": null,
+      "latency_seconds": 3.4,
+      "llm_calls": 2,
+      "llm_calls_by_model": {
+        "gpt-4.1-mini": 1,
+        "gpt-4o": 1
+      },
+      "input_tokens": 3519,
+      "output_tokens": 31,
+      "cost_usd": 0.00817
+    },
+    {
+      "id": "q02",
+      "group": 1,
+      "question": "Which country are those suppliers from? give me a chart suitable for this",
+      "rewritten_question": "Which country are the suppliers of the specified products from? Please provide a chart suitable for this information.",
+      "answer": "Please specify the products you are interested in so I can provide the information about the countries of their suppliers.",
+      "sql": "",
+      "wants_chart": true,
+      "chart": null,
+      "latency_seconds": 3.1,
+      "llm_calls": 2,
+      "llm_calls_by_model": {
+        "gpt-4.1-mini": 1,
+        "gpt-4o": 1
+      },
+      "input_tokens": 3752,
+      "output_tokens": 53,
+      "cost_usd": 0.00642
+    },
+    {
+      "id": "q03",
+      "group": 1,
+      "question": "List all product categories with their category names",
+      "rewritten_question": "List all product categories along with their category names.",
+      "answer": "Here are all the product categories along with their names:\n\n1. Beverages\n2. Condiments\n3. Confections\n4. Dairy Products\n5. Grains/Cereals\n6. Meat/Poultry\n7. Produce\n8. Seafood",
+      "sql": "SELECT category_id, category_name FROM categories ORDER BY category_id;",
+      "wants_chart": false,
+      "chart": null,
+      "latency_seconds": 3.9,
+      "llm_calls": 3,
+      "llm_calls_by_model": {
+        "gpt-4.1-mini": 1,
+        "gpt-4o": 2
+      },
+      "input_tokens": 6845,
+      "output_tokens": 102,
+      "cost_usd": 0.00969
+    },
+    {
+      "id": "q04",
+      "group": 2,
+      "question": "Which category had the highest revenue?",
+      "rewritten_question": "Which category had the highest revenue?",
+      "answer": "The category with the highest revenue is \"Beverages,\" with a total revenue of approximately 267,868.18.",
+      "sql": "SELECT c.category_name, SUM(od.unit_price * od.quantity * (1 - od.discount)) AS revenue\nFROM order_details od\nJOIN products p ON od.product_id = p.product_id\nJOIN categories c ON p.category_id = c.category_id\nGROUP BY c.category_name\nORDER BY revenue DESC\nLIMIT 1;",
+      "wants_chart": true,
+      "chart": "bar (1 rows)",
+      "latency_seconds": 5.5,
+      "llm_calls": 4,
+      "llm_calls_by_model": {
+        "gpt-4.1-mini": 2,
+        "gpt-4o": 2
+      },
+      "input_tokens": 7761,
+      "output_tokens": 162,
+      "cost_usd": 0.01055
+    },
+    {
+      "id": "q05",
+      "group": 2,
+      "question": "How many products are in that category?",
+      "rewritten_question": "How many products are in the \"Beverages\" category?",
+      "answer": "There are 12 products in the \"Beverages\" category.",
+      "sql": "SELECT COUNT(*) FROM products WHERE category_id = (SELECT category_id FROM categories WHERE category_name = 'Beverages')",
+      "wants_chart": false,
+      "chart": null,
+      "latency_seconds": 3.6,
+      "llm_calls": 3,
+      "llm_calls_by_model": {
+        "gpt-4.1-mini": 1,
+        "gpt-4o": 2
+      },
+      "input_tokens": 6773,
+      "output_tokens": 78,
+      "cost_usd": 0.00913
+    },
+    {
+      "id": "q06",
+      "group": 3,
+      "question": "Which country has the most suppliers? Show as a pie chart",
+      "rewritten_question": "Which country has the most suppliers? Please show the result as a pie chart.",
+      "answer": "The country with the most suppliers is the USA, with a total of 4 suppliers. Below is a breakdown of the number of suppliers by country, which can be visualized in a pie chart to show the distribution:\n\n- USA: 4 suppliers\n- France: 3 suppliers\n- Germany: 3 suppliers\n- Italy: 2 suppliers\n- Sweden: 2 suppliers\n- UK: 2 suppliers\n- Australia: 2 suppliers\n- Japan: 2 suppliers\n- Canada: 2 suppliers\n- Finland: 1 supplier\n- Norway: 1 supplier\n- Netherlands: 1 supplier\n- Brazil: 1 supplier\n- Denmark: 1 supplier\n- Singapore: 1 supplier\n- Spain: 1 supplier",
+      "sql": "SELECT country, COUNT(*) AS supplier_count FROM suppliers GROUP BY country ORDER BY supplier_count DESC",
+      "wants_chart": true,
+      "chart": "pie (16 rows)",
+      "latency_seconds": 6.8,
+      "llm_calls": 4,
+      "llm_calls_by_model": {
+        "gpt-4.1-mini": 2,
+        "gpt-4o": 2
+      },
+      "input_tokens": 7993,
+      "output_tokens": 255,
+      "cost_usd": 0.01194
+    },
+    {
+      "id": "q07",
+      "group": 3,
+      "question": "Who are the top 5 employees by number of orders handled?",
+      "rewritten_question": "Who are the top 5 employees by number of orders handled?",
+      "answer": "The top 5 employees by the number of orders handled are:\n\n1. Margaret Peacock with 156 orders.\n2. Janet Leverling with 127 orders.\n3. Nancy Davolio with 123 orders.\n4. Laura Callahan with 104 orders.\n5. Andrew Fuller with 96 orders.",
+      "sql": "SELECT e.employee_id, e.first_name, e.last_name, COUNT(o.order_id) AS order_count\nFROM employees e\nJOIN orders o ON e.employee_id = o.employee_id\nGROUP BY e.employee_id, e.first_name, e.last_name\nORDER BY order_count DESC\nLIMIT 5;",
+      "wants_chart": true,
+      "chart": "bar (5 rows)",
+      "latency_seconds": 6.4,
+      "llm_calls": 4,
+      "llm_calls_by_model": {
+        "gpt-4.1-mini": 2,
+        "gpt-4o": 2
+      },
+      "input_tokens": 8088,
+      "output_tokens": 208,
+      "cost_usd": 0.01148
+    },
+    {
+      "id": "q08",
+      "group": 4,
+      "question": "Which products are below their reorder level? List them with current stock and reorder point",
+      "rewritten_question": "Which products are below their reorder level? Please list these products along with their current stock and reorder point.",
+      "answer": "The following products are currently below their reorder level:\n\n1. Aniseed Syrup: 13 units in stock, reorder level is 25.\n2. Chang: 17 units in stock, reorder level is 25.\n3. Chocolade: 15 units in stock, reorder level is 25.\n4. Gnocchi di nonna Alice: 21 units in stock, reorder level is 30.\n5. Gorgonzola Telino: 0 units in stock, reorder level is 20.\n6. Gravad lax: 11 units in stock, reorder level is 25.\n7. Ipoh Coffee: 17 units in stock, reorder level is 25.\n8. Longlife Tofu: 4 units in stock, reorder level is 5.\n9. Louisiana Hot Spiced Okra: 4 units in stock, reorder level is 20.\n10. Mascarpone Fabioli: 9 units in stock, reorder level is 25.\n11. Maxilaku: 10 units in stock, reorder level is 15.\n12. Nord-Ost Matjeshering: 10 units in stock, reorder level is 15.\n13. Outback Lager: 15 units in stock, reorder level is 30.\n14. Queso Cabrales: 22 units in stock, reorder level is 30.\n15. Rogede sild: 5 units in stock, reorder level is 15.\n16. Scottish Longbreads: 6 units in stock, reorder level is 15.\n17. Sir Rodney's Scones: 3 units in stock, reorder level is 5.\n18. Wimmers gute Semmelknödel: 22 units in stock, reorder level is 30.\n\nThese products should be considered for reorder to maintain adequate stock levels.",
+      "sql": "SELECT product_name, units_in_stock, reorder_level FROM products WHERE units_in_stock < reorder_level ORDER BY product_name;",
+      "wants_chart": false,
+      "chart": null,
+      "latency_seconds": 7.4,
+      "llm_calls": 3,
+      "llm_calls_by_model": {
+        "gpt-4.1-mini": 1,
+        "gpt-4o": 2
+      },
+      "input_tokens": 7006,
+      "output_tokens": 446,
+      "cost_usd": 0.01338
+    },
+    {
+      "id": "q09",
+      "group": 5,
+      "question": "Show me monthly order volume trend for 1997 as a line chart",
+      "rewritten_question": "Show me the monthly order volume trend for the year 1997 as a line chart.",
+      "answer": "The monthly order volume trend for the year 1997 shows the following pattern:\n\n- January: 33 orders\n- February: 29 orders\n- March: 30 orders\n- April: 31 orders\n- May: 32 orders\n- June: 30 orders\n- July: 33 orders\n- August: 33 orders\n- September: 37 orders\n- October: 38 orders\n- November: 34 orders\n- December: 48 orders\n\nDecember had the highest order volume with 48 orders, while February had the lowest with 29 orders. This trend can be visualized as a line chart to better understand the fluctuations throughout the year.",
+      "sql": "SELECT DATE_TRUNC('month', order_date) AS month, COUNT(order_id) AS order_count FROM orders WHERE EXTRACT(YEAR FROM order_date) = 1997 GROUP BY month ORDER BY month;",
+      "wants_chart": true,
+      "chart": "line (12 rows)",
+      "latency_seconds": 7.3,
+      "llm_calls": 4,
+      "llm_calls_by_model": {
+        "gpt-4.1-mini": 2,
+        "gpt-4o": 2
+      },
+      "input_tokens": 8340,
+      "output_tokens": 268,
+      "cost_usd": 0.01254
+    },
+    {
+      "id": "q10",
+      "group": 6,
+      "question": "Which supplier provides the most expensive products on average?",
+      "rewritten_question": "Which supplier provides the most expensive products on average?",
+      "answer": "The supplier \"Aux joyeux ecclésiastiques\" provides the most expensive products on average, with an average product price of 140.75.",
+      "sql": "SELECT s.company_name, AVG(p.unit_price) AS average_price\nFROM suppliers s\nJOIN products p ON s.supplier_id = p.supplier_id\nGROUP BY s.company_name\nORDER BY average_price DESC\nLIMIT 1;",
+      "wants_chart": true,
+      "chart": "bar (1 rows)",
+      "latency_seconds": 5.5,
+      "llm_calls": 4,
+      "llm_calls_by_model": {
+        "gpt-4.1-mini": 2,
+        "gpt-4o": 2
+      },
+      "input_tokens": 7747,
+      "output_tokens": 157,
+      "cost_usd": 0.01073
+    },
+    {
+      "id": "q11",
+      "group": 7,
+      "question": "What are the top 3 most ordered products?",
+      "rewritten_question": "What are the top 3 most ordered products?",
+      "answer": "The top three most ordered products are:\n\n1. Camembert Pierrot with a total of 1,577 units ordered.\n2. Raclette Courdavault with a total of 1,496 units ordered.\n3. Gorgonzola Telino with a total of 1,397 units ordered.",
+      "sql": "SELECT p.product_name, SUM(od.quantity) AS total_quantity_ordered\nFROM order_details od\nJOIN products p ON od.product_id = p.product_id\nGROUP BY p.product_name\nORDER BY total_quantity_ordered DESC\nLIMIT 3;",
+      "wants_chart": true,
+      "chart": "bar (3 rows)",
+      "latency_seconds": 6.9,
+      "llm_calls": 4,
+      "llm_calls_by_model": {
+        "gpt-4.1-mini": 2,
+        "gpt-4o": 2
+      },
+      "input_tokens": 7828,
+      "output_tokens": 194,
+      "cost_usd": 0.01117
+    }
+  ]
+}

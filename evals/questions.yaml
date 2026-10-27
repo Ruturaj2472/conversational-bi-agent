@@ -1,0 +1,137 @@
+# Evaluation set for the Conversational BI agent (Northwind).
+#
+# Questions with the same `group` share one session, so follow-ups work.
+#
+# Fields:
+#   reference_sql          Ground-truth query. The agent's result must contain the
+#                          same values (extra columns in the agent result are fine).
+#   match                  set     — same rows, any order
+#                          ordered — same rows, same order
+#                          top_row — the agent's first row matches the reference's first row
+#   expects_chart          true / false, or null when either is acceptable
+#   expected_chart_type    checked only when expects_chart is true
+#   expects_clarification  true when the question is ambiguous and the agent should ask
+
+questions:
+  - id: q01
+    group: 1
+    category: ambiguous
+    question: Who supplies those products?
+    expects_clarification: true
+    expects_chart: false
+
+  - id: q02
+    group: 1
+    category: ambiguous
+    question: Which country are those suppliers from? give me a chart suitable for this
+    expects_clarification: true
+    expects_chart: false
+
+  - id: q03
+    group: 1
+    category: listing
+    question: List all product categories with their category names
+    reference_sql: SELECT category_name FROM categories ORDER BY category_id
+    match: set
+    expects_chart: false
+
+  - id: q04
+    group: 2
+    category: ranking
+    question: Which category had the highest revenue?
+    reference_sql: |
+      SELECT c.category_name,
+             ROUND(SUM(od.unit_price * od.quantity * (1 - od.discount))::numeric, 2) AS revenue
+      FROM order_details od
+      JOIN products p ON p.product_id = od.product_id
+      JOIN categories c ON c.category_id = p.category_id
+      GROUP BY c.category_name
+      ORDER BY revenue DESC
+    match: top_row
+    expects_chart: null
+
+  - id: q05
+    group: 2
+    category: follow_up
+    question: How many products are in that category?
+    reference_sql: |
+      SELECT COUNT(*) FROM products p
+      JOIN categories c ON c.category_id = p.category_id
+      WHERE c.category_name = 'Beverages'
+    match: set
+    expects_chart: false
+
+  - id: q06
+    group: 3
+    category: distribution
+    question: Which country has the most suppliers? Show as a pie chart
+    reference_sql: SELECT country, COUNT(*) AS supplier_count FROM suppliers GROUP BY country
+    match: set
+    expects_chart: true
+    expected_chart_type: pie
+
+  - id: q07
+    group: 3
+    category: ranking
+    question: Who are the top 5 employees by number of orders handled?
+    reference_sql: |
+      SELECT e.first_name, e.last_name, COUNT(o.order_id) AS order_count
+      FROM employees e
+      JOIN orders o ON o.employee_id = e.employee_id
+      GROUP BY e.employee_id, e.first_name, e.last_name
+      ORDER BY order_count DESC
+      LIMIT 5
+    match: ordered
+    expects_chart: null
+
+  - id: q08
+    group: 4
+    category: filter
+    question: Which products are below their reorder level? List them with current stock and reorder point
+    reference_sql: |
+      SELECT product_name, units_in_stock, reorder_level
+      FROM products
+      WHERE units_in_stock < reorder_level
+    match: set
+    expects_chart: false
+
+  - id: q09
+    group: 5
+    category: trend
+    question: Show me monthly order volume trend for 1997 as a line chart
+    reference_sql: |
+      SELECT DATE_TRUNC('month', order_date) AS month, COUNT(*) AS order_count
+      FROM orders
+      WHERE order_date >= '1997-01-01' AND order_date < '1998-01-01'
+      GROUP BY 1
+      ORDER BY 1
+    match: ordered
+    expects_chart: true
+    expected_chart_type: line
+
+  - id: q10
+    group: 6
+    category: ranking
+    question: Which supplier provides the most expensive products on average?
+    reference_sql: |
+      SELECT s.company_name, ROUND(AVG(p.unit_price)::numeric, 2) AS average_price
+      FROM suppliers s
+      JOIN products p ON p.supplier_id = s.supplier_id
+      GROUP BY s.company_name
+      ORDER BY average_price DESC
+    match: top_row
+    expects_chart: null
+
+  - id: q11
+    group: 7
+    category: ranking
+    question: What are the top 3 most ordered products?
+    reference_sql: |
+      SELECT p.product_name, SUM(od.quantity) AS total_quantity
+      FROM order_details od
+      JOIN products p ON p.product_id = od.product_id
+      GROUP BY p.product_name
+      ORDER BY total_quantity DESC
+      LIMIT 3
+    match: ordered
+    expects_chart: null
