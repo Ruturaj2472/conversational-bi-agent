@@ -274,7 +274,7 @@ Measured end to end on the Docker stack (PostgreSQL 16 + Northwind) with the 11 
 | Output tokens | 2,800 | **1,954** (−30%) |
 | Input tokens served from prompt cache | 14% | **85%** |
 | Correct and complete answers | 7 / 11 | **11 / 11** |
-| Charts produced for chart questions | 2 / 7 | **6 / 7** |
+| Chart accuracy (chart of the right type when expected, none when not) | 5 / 7 | **7 / 7** |
 | OpenAI cost per question | $0.0094 | $0.0105 |
 
 **Cost trade-off:** the current version sends the full schema (14 tables, ~2,700 tokens) with every gpt-4o call instead of looking up only the relevant tables with an extra LLM call. That removes round trips — which is where the latency gain comes from — but adds input tokens. Most of them are served from OpenAI's prompt cache at a discount, and the result is about $0.001 more per question. For much larger schemas, selecting relevant tables first (e.g. by keyword or embedding search) would keep the prompt small without adding an LLM call.
@@ -620,7 +620,7 @@ Recorded run of the 11 questions (`evals/results/optimized_run.json`), gpt-4o + 
 | Questions passed | **11 / 11** |
 | Execution accuracy | **100%** (9 / 9) |
 | Clarification accuracy | **100%** (2 / 2) |
-| Chart accuracy | **100%** (7 / 7) |
+| Chart accuracy (chart of the right type when expected, none when not) | **100%** (7 / 7) |
 | Errors | 0 |
 | Avg / p95 latency | 5.4 s / 7.4 s |
 | Avg LLM calls per question | 3.4 |
