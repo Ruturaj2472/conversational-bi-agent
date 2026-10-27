@@ -18,7 +18,9 @@ A full-stack BI agent that lets you query your database in plain English, get cl
 10. [Environment Variables](#10-environment-variables)
 11. [API Reference](#11-api-reference)
 12. [Testing](#12-testing)
-13. [Example Questions](#13-example-questions)
+13. [Evaluation](#13-evaluation)
+14. [Continuous Integration](#14-continuous-integration)
+15. [Example Questions](#15-example-questions)
 
 ---
 
@@ -96,7 +98,7 @@ With Docker Compose, all of these — PostgreSQL, MLflow, the FastAPI backend an
 | Experiment Tracking | MLflow |
 | Frontend | Streamlit |
 | Containerisation | Docker + Docker Compose |
-| Tests | pytest |
+| Tests, Evaluation & CI | pytest, ruff, GitHub Actions |
 
 ---
 
@@ -125,6 +127,18 @@ conversational-bi-agent/
 │   └── load_chinook.py         # Alternative: Chinook music store DB
 │
 ├── tests/                      # pytest suite (no OpenAI key or Postgres needed)
+│   └── integration/            # Tests against a real PostgreSQL (skipped without one)
+│
+├── evals/
+│   ├── questions.yaml          # Evaluation set — questions + reference SQL + expectations
+│   ├── scoring.py              # Execution accuracy, chart and clarification checks
+│   ├── run_eval.py             # Scores a recorded run (--replay) or a running API (--live)
+│   ├── baseline.json           # Recorded scores + thresholds enforced in CI
+│   └── results/
+│       └── optimized_run.json  # Recorded run: answers, SQL, latency, LLM calls, tokens, cost
+│
+├── .github/workflows/ci.yml    # CI: lint, tests, Docker builds, secret scan, evaluation
+├── pyproject.toml              # ruff + pytest settings
 │
 ├── docker/postgres/
 │   └── 01-create-memory-db.sh  # Creates the agent_memory DB on first Postgres start
@@ -134,7 +148,7 @@ conversational-bi-agent/
 ├── docker-compose.yml          # Full stack: postgres, db-loader, mlflow, bi-agent, bi-ui
 ├── requirements.txt            # API dependencies (pinned)
 ├── requirements-ui.txt         # Streamlit UI dependencies (pinned)
-├── requirements-dev.txt        # Everything + pytest, black
+├── requirements-dev.txt        # Everything + pytest, ruff
 └── .env.example                # Environment variable template
 ```
 
@@ -488,10 +502,84 @@ pytest
 | `tests/test_memory.py` | Ordered batch writes, latest-N history, truncation, clearing |
 | `tests/test_charts.py` | Every chart type, non-numeric values, date labels, concurrent rendering |
 | `tests/test_agent_graph.py` | End-to-end graph runs: chart flow, schema in prompt, SQL retry, retry cap, empty results |
+| `tests/test_eval_scoring.py` | Evaluation scoring rules and consistency of the `evals/` files |
+
+### Integration tests (real PostgreSQL)
+
+`tests/integration/` runs against PostgreSQL with Northwind loaded and is skipped unless the database URLs are set:
+
+```bash
+# with the Docker stack running
+export INTEGRATION_DB_URL=postgresql+psycopg2://postgres:<password>@localhost:5432/northwind
+export INTEGRATION_MEMORY_DB_URL=postgresql+psycopg2://postgres:<password>@localhost:5432/agent_memory
+pytest tests/integration
+```
+
+They check that writes (`DELETE`, `DROP`) are rejected by the database, that the statement timeout stops slow queries, numeric/date conversion, the row cap, every reference query in `evals/questions.yaml`, and the memory store with its index.
 
 ---
 
-## 13. Example Questions
+## 13. Evaluation
+
+`evals/` measures answer quality with **execution accuracy**: the agent's SQL and a hand-written reference query are both executed on PostgreSQL, and the results must match (column names and extra columns are ignored; row order is checked where the question implies one). No LLM is used for scoring.
+
+Each question in `evals/questions.yaml` has a category and expectations:
+
+| Check | Passes when |
+|---|---|
+| Execution | The agent's result matches the reference result (`set`, `ordered`, or `top_row` match) |
+| Clarification | For ambiguous questions ("Who supplies *those* products?" with no context), the agent asks instead of running SQL |
+| Chart | A chart of the expected type is produced when one is expected, and none when it isn't |
+
+### Current scores
+
+Recorded run of the 11 questions (`evals/results/optimized_run.json`), gpt-4o + gpt-4.1-mini:
+
+| Metric | Score |
+|---|---|
+| Questions passed | **11 / 11** |
+| Execution accuracy | **100%** (9 / 9) |
+| Clarification accuracy | **100%** (2 / 2) |
+| Chart accuracy | **100%** (7 / 7) |
+| Errors | 0 |
+| Avg / p95 latency | 5.4 s / 7.4 s |
+| Avg LLM calls per question | 3.4 |
+| Avg cost per question | $0.0105 |
+
+### Running the evaluation
+
+```bash
+# Score the recorded run (no OpenAI calls; needs PostgreSQL with Northwind)
+python -m evals.run_eval
+
+# Fail with exit code 1 if a threshold in evals/baseline.json is not met
+python -m evals.run_eval --check
+
+# Ask a running API every question, score the answers and save them as a new run
+# (calls OpenAI through the agent)
+python -m evals.run_eval --live --api http://localhost:8000 --save evals/results/live_run.json
+```
+
+Database connection comes from `EVAL_DB_URL` or the `POSTGRES_*` variables.
+
+Thresholds (`evals/baseline.json`): execution accuracy ≥ 85%, clarification accuracy 100%, chart accuracy ≥ 85%, 0 errors, ≤ 4 LLM calls and ≤ $0.012 per question on average.
+
+---
+
+## 14. Continuous Integration
+
+`.github/workflows/ci.yml` runs on every push to `main` and every pull request. None of the jobs call OpenAI.
+
+| Job | What it checks |
+|---|---|
+| `lint-and-unit-tests` | `ruff check` and the unit test suite |
+| `docker` | Both images build; `docker-compose.yml` is valid |
+| `secret-scan` | gitleaks scans the git history for committed secrets |
+| `integration-and-eval` | PostgreSQL 16 service + Northwind: integration tests, then `python -m evals.run_eval --check` on the recorded run; the report is uploaded as an artifact |
+
+---
+
+## 15. Example Questions
 
 From `example_queries.txt` (questions in the same group share a session, so follow-ups work):
 
