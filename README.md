@@ -1,26 +1,53 @@
-# 🧠 Conversational Business Intelligence Agent
+<h1 align="center">🧠 Conversational Business Intelligence Agent</h1>
 
-A full-stack BI agent that lets you query your database in plain English, get clean answers, and generate charts — all from a chat interface.
+<p align="center">
+  Ask your database questions in plain English — get a clear answer, the exact SQL, and a chart when it helps.
+</p>
+
+<p align="center">
+  <a href="https://github.com/Ruturaj2472/conversational-bi-agent/actions/workflows/ci.yml"><img src="https://github.com/Ruturaj2472/conversational-bi-agent/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <img src="https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white" alt="Python 3.13">
+  <img src="https://img.shields.io/badge/LangGraph-agent-1C3C3C?logo=langchain&logoColor=white" alt="LangGraph">
+  <img src="https://img.shields.io/badge/OpenAI-GPT--4o-412991?logo=openai&logoColor=white" alt="OpenAI">
+  <img src="https://img.shields.io/badge/FastAPI-backend-009688?logo=fastapi&logoColor=white" alt="FastAPI">
+  <img src="https://img.shields.io/badge/Streamlit-UI-FF4B4B?logo=streamlit&logoColor=white" alt="Streamlit">
+  <img src="https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql&logoColor=white" alt="PostgreSQL 16">
+  <img src="https://img.shields.io/badge/MLflow-tracing-0194E2?logo=mlflow&logoColor=white" alt="MLflow">
+  <img src="https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white" alt="Docker Compose">
+</p>
+
+<p align="center">
+  <img src="snapshots/streamlit2.png" alt="Streamlit chat: the SQL that was run, the rewritten question, and a line chart of monthly orders" width="900">
+</p>
+
+<div align="center">
+
+| ⚡ Avg response | 🔁 LLM calls / question | ✅ Evaluation | 🐳 Run it |
+|:---:|:---:|:---:|:---:|
+| **5.4 s** | **2–4** | **11 / 11** questions passed | `docker compose up --build` |
+
+</div>
 
 ---
 
 ## Table of Contents
 
 1. [Project Overview](#1-project-overview)
-2. [Architecture](#2-architecture)
-3. [Tech Stack](#3-tech-stack)
-4. [Project Structure](#4-project-structure)
-5. [Agent Graph](#5-agent-graph)
-6. [Performance](#6-performance)
-7. [Prerequisites](#7-prerequisites)
-8. [Running with Docker](#8-running-with-docker)
-9. [Running Locally (without Docker)](#9-running-locally-without-docker)
-10. [Environment Variables](#10-environment-variables)
-11. [API Reference](#11-api-reference)
-12. [Testing](#12-testing)
-13. [Evaluation](#13-evaluation)
-14. [Continuous Integration](#14-continuous-integration)
-15. [Example Questions](#15-example-questions)
+2. [Demo](#2-demo)
+3. [Architecture](#3-architecture)
+4. [Tech Stack](#4-tech-stack)
+5. [Project Structure](#5-project-structure)
+6. [Agent Graph](#6-agent-graph)
+7. [Performance](#7-performance)
+8. [Prerequisites](#8-prerequisites)
+9. [Running with Docker](#9-running-with-docker)
+10. [Running Locally (without Docker)](#10-running-locally-without-docker)
+11. [Environment Variables](#11-environment-variables)
+12. [API Reference](#12-api-reference)
+13. [Testing](#13-testing)
+14. [Evaluation](#14-evaluation)
+15. [Continuous Integration](#15-continuous-integration)
+16. [Example Questions](#16-example-questions)
 
 ---
 
@@ -47,7 +74,38 @@ This system lets business users ask natural language questions about their data 
 
 ---
 
-## 2. Architecture
+## 2. Demo
+
+### Chat with your data
+
+Ask a question in the chat; the sidebar shows the API status, the session (each session has its own memory) and the available tables.
+
+<p align="center">
+  <img src="snapshots/Streamlit1.png" alt="Streamlit chat answering a question about monthly order volume in 1997" width="900">
+</p>
+
+### Charts generated from the real query results
+
+The agent decides when a chart helps and which type fits the data — a line chart for a trend, a pie chart for a distribution:
+
+<table>
+  <tr>
+    <td align="center" width="62%"><img src="snapshots/line_chart.png" alt="Line chart: monthly order volume for 1997"><br><sub><i>"Show me monthly order volume trend for 1997 as a line chart"</i></sub></td>
+    <td align="center" width="38%"><img src="snapshots/pie_chart.png" alt="Pie chart: suppliers by country"><br><sub><i>"Which country has the most suppliers? Show as a pie chart"</i></sub></td>
+  </tr>
+</table>
+
+### Complete answers
+
+Every group is included — all 16 supplier countries, not just a top-10:
+
+<p align="center">
+  <img src="snapshots/streamlit3.png" alt="Answer listing the number of suppliers in each of 16 countries" width="900">
+</p>
+
+---
+
+## 3. Architecture
 
 ```
                     ┌─────────────────────────────────┐
@@ -85,7 +143,7 @@ With Docker Compose, all of these — PostgreSQL, MLflow, the FastAPI backend an
 
 ---
 
-## 3. Tech Stack
+## 4. Tech Stack
 
 | Component | Technology |
 |---|---|
@@ -102,7 +160,7 @@ With Docker Compose, all of these — PostgreSQL, MLflow, the FastAPI backend an
 
 ---
 
-## 4. Project Structure
+## 5. Project Structure
 
 ```
 conversational-bi-agent/
@@ -140,6 +198,8 @@ conversational-bi-agent/
 ├── .github/workflows/ci.yml    # CI: lint, tests, Docker builds, secret scan, evaluation
 ├── pyproject.toml              # ruff + pytest settings
 │
+├── snapshots/                  # Screenshots used in this README
+│
 ├── docker/postgres/
 │   └── 01-create-memory-db.sh  # Creates the agent_memory DB on first Postgres start
 │
@@ -154,7 +214,7 @@ conversational-bi-agent/
 
 ---
 
-## 5. Agent Graph
+## 6. Agent Graph
 
 Every user message flows through this LangGraph pipeline:
 
@@ -200,7 +260,7 @@ LLM calls per question: **2** (plain question) to **4** (chart question), plus 1
 
 ---
 
-## 6. Performance
+## 7. Performance
 
 Measured end to end on the Docker stack (PostgreSQL 16 + Northwind) with the 11 questions in `example_queries.txt`, comparing the original version of this project (commit `4c85659`) with the current one. Both used the same database, the same library versions and the same models (gpt-4o + gpt-4.1-mini). LLM calls, tokens and cost come from MLflow traces; answers were checked against the database.
 
@@ -221,9 +281,17 @@ Measured end to end on the Docker stack (PostgreSQL 16 + Northwind) with the 11 
 
 These figures come from one run of 11 questions per version; LLM latency varies between runs, so treat percentages as approximate.
 
+### Seen in MLflow
+
+Both versions logged to the same MLflow server — current version (`bi-agent`, left) and original (`bi-agent-baseline`, right). Average traced agent latency **4.88 s vs 7.26 s**, with 0 errors in both:
+
+<p align="center">
+  <img src="snapshots/ML_flow.png" alt="MLflow overview of the bi-agent and bi-agent-baseline experiments: traces, latency and errors" width="900">
+</p>
+
 ---
 
-## 7. Prerequisites
+## 8. Prerequisites
 
 - Docker Desktop (includes Docker Compose) — for the Docker option
 - Python 3.11+ and PostgreSQL 14+ — only for running without Docker
@@ -231,7 +299,7 @@ These figures come from one run of 11 questions per version; LLM latency varies 
 
 ---
 
-## 8. Running with Docker
+## 9. Running with Docker
 
 Docker Compose runs the whole stack: PostgreSQL, a one-off Northwind loader, MLflow, the FastAPI backend and the Streamlit UI.
 
@@ -273,6 +341,18 @@ The first build takes a few minutes. Later starts are fast, and data persists in
 | MLflow UI | http://localhost:5000 |
 | PostgreSQL | `localhost:5432` (user/password from `.env`) |
 
+`docker compose ps` — all four long-running services healthy:
+
+<p align="center">
+  <img src="snapshots/Docker-compose.png" alt="docker compose ps showing bi-agent, bi-mlflow, bi-postgres and bi-ui up and healthy" width="900">
+</p>
+
+The same stack in Docker Desktop (`db-loader` has finished its one-off data load):
+
+<p align="center">
+  <img src="snapshots/docker-desktop.png" alt="Docker Desktop showing the conversationalbi stack: postgres, mlflow, db-loader, bi-agent and bi-ui" width="900">
+</p>
+
 ### Docker management commands
 
 ```bash
@@ -310,7 +390,7 @@ db-loader  ──► postgres:5432      (one-off data load)
 
 ---
 
-## 9. Running Locally (without Docker)
+## 10. Running Locally (without Docker)
 
 ### Step 1 — Install
 
@@ -409,7 +489,7 @@ streamlit run streamlit_app.py
 
 ---
 
-## 10. Environment Variables
+## 11. Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
@@ -437,7 +517,7 @@ streamlit run streamlit_app.py
 
 ---
 
-## 11. API Reference
+## 12. API Reference
 
 ### `POST /chart`
 Main endpoint — returns answer + SQL + optional chart.
@@ -486,7 +566,7 @@ Health check — returns model name and version.
 
 ---
 
-## 12. Testing
+## 13. Testing
 
 The test suite runs without an OpenAI key or PostgreSQL: it uses SQLite and a scripted fake LLM to run the full LangGraph agent.
 
@@ -519,7 +599,7 @@ They check that writes (`DELETE`, `DROP`) are rejected by the database, that the
 
 ---
 
-## 13. Evaluation
+## 14. Evaluation
 
 `evals/` measures answer quality with **execution accuracy**: the agent's SQL and a hand-written reference query are both executed on PostgreSQL, and the results must match (column names and extra columns are ignored; row order is checked where the question implies one). No LLM is used for scoring.
 
@@ -566,7 +646,7 @@ Thresholds (`evals/baseline.json`): execution accuracy ≥ 85%, clarification ac
 
 ---
 
-## 14. Continuous Integration
+## 15. Continuous Integration
 
 `.github/workflows/ci.yml` runs on every push to `main` and every pull request. None of the jobs call OpenAI.
 
@@ -579,7 +659,7 @@ Thresholds (`evals/baseline.json`): execution accuracy ≥ 85%, clarification ac
 
 ---
 
-## 15. Example Questions
+## 16. Example Questions
 
 From `example_queries.txt` (questions in the same group share a session, so follow-ups work):
 
