@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.13"
+
+jobs:
+  # ── Gate 1: lint + unit tests (no database, no OpenAI) ────────────────────
+  lint-and-unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements-dev.txt
+      - name: Lint
+        run: ruff check .
+      - name: Unit tests
+        env:
+          OPENAI_API_KEY: sk-test
+        run: pytest -q
+
+  # ── Gate 1: Docker images build, compose file is valid ────────────────────
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build API image
+        run: docker build -t conversational-bi-agent:ci -f Dockerfile .
+      - name: Build UI image
+        run: docker build -t conversational-bi-ui:ci -f Dockerfile.streamlit .
+      - name: Validate docker-compose.yml
+        run: |
+          cp .env.example .env
+          docker compose config --quiet
+
+  # ── Gate 1: no secrets committed ──────────────────────────────────────────
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── Gate 2: real PostgreSQL + Northwind, evaluation replay (no OpenAI) ────
+  integration-and-eval:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: northwind
+      OPENAI_API_KEY: sk-test
+      INTEGRATION_DB_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/northwind
+      INTEGRATION_MEMORY_DB_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/agent_memory
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements-dev.txt
+      - name: Create memory database
+        run: PGPASSWORD=postgres psql -h localhost -U postgres -c "CREATE DATABASE agent_memory"
+      - name: Load Northwind
+        run: python scripts/load_northwind.py
+      - name: Integration tests
+        run: pytest -q tests/integration
+      - name: Evaluation (replay recorded run, check thresholds)
+        run: python -m evals.run_eval --check --report eval-report.json
+      - name: Upload evaluation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: eval-report.json

@@ -1,0 +1,10 @@
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+# Pyflakes (real bugs: undefined names, unused imports/variables) + syntax errors
+select = ["F", "E9"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

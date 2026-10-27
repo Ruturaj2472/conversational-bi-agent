@@ -62,7 +62,7 @@ def create_database() -> None:
     conn.autocommit = True
     cur = conn.cursor()
 
-    cur.execute(f"SELECT 1 FROM pg_database WHERE datname = %s", (PG_DB,))
+    cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (PG_DB,))
     exists = cur.fetchone()
     if exists:
         logger.info(f"  ✓ Database '{PG_DB}' already exists.")
